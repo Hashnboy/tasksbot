@@ -1,4 +1,3 @@
-
 import telebot
 import gspread
 import schedule
@@ -27,11 +26,15 @@ def get_users():
     users = []
     rows = users_ws.get_all_records()
     for row in rows:
-        if row["Telegram ID"]:
+        if row.get("Telegram ID"):
+            categories = []
+            raw = row.get("Категории задач") or ""
+            if raw:
+                categories = [c.strip() for c in raw.split(",") if c.strip()]
             users.append({
-                "name": row["Имя"],
-                "id": str(row["Telegram ID"]),
-                "categories": [c.strip() for c in row["Категории задач"].split(",")] if row["Категории задач"] else []
+                "name": row.get("Имя", ""),
+                "id": str(row.get("Telegram ID")),
+                "categories": categories
             })
     return users
 
@@ -41,12 +44,13 @@ def get_tasks_for_date(user_id, date_str):
     users = get_users()
     user_info = next((u for u in users if u["id"] == str(user_id)), None)
     for row in rows:
-        if row["Дата"] == date_str:
-            if not user_info or not user_info["categories"] or row["Категория"] in user_info["categories"]:
+        if row.get("Дата") == date_str:
+            if not user_info or not user_info["categories"] or row.get("Категория") in user_info["categories"]:
                 tasks.append(row)
     return tasks
 
 def add_task(date, category, subcategory, task, deadline, status="", repeat=""):
+    # Добавляем новую строку в конец листа
     tasks_ws.append_row([date, category, subcategory, task, deadline, status, repeat])
 
 def process_repeating_tasks():
@@ -61,14 +65,19 @@ def process_repeating_tasks():
         "saturday": "суббота",
         "sunday": "воскресенье"
     }
-    today_rus = weekday_map[today_weekday]
+    today_rus = weekday_map.get(today_weekday, "")
 
-    existing_tasks_today = [t["Задача"] for t in tasks_ws.get_all_records() if t["Дата"] == today_str]
+    existing_tasks_today = [t.get("Задача") for t in tasks_ws.get_all_records() if t.get("Дата") == today_str]
 
     for row in repeat_ws.get_all_records():
-        if row["День недели"].strip().lower() == today_rus:
-            if row["Задача"] not in existing_tasks_today:
-                add_task(today_str, row["Категория"], row["Подкатегория"], row["Задача"], row["Время"], "", "повтор")
+        if (row.get("День недели") or "").strip().lower() == today_rus:
+            if row.get("Задача") and row.get("Задача") not in existing_tasks_today:
+                add_task(today_str,
+                         row.get("Категория", ""),
+                         row.get("Подкатегория", ""),
+                         row.get("Задача", ""),
+                         row.get("Время", ""),
+                         "", "повтор")
 
 def schedule_next_repeat_tasks():
     weekday_to_int = {
@@ -82,16 +91,25 @@ def schedule_next_repeat_tasks():
     }
     today = datetime.now()
     for row in repeat_ws.get_all_records():
-        target_weekday = weekday_to_int[row["День недели"].strip().lower()]
+        dow_raw = (row.get("День недели") or "").strip().lower()
+        if dow_raw not in weekday_to_int:
+            continue
+        target_weekday = weekday_to_int[dow_raw]
         days_ahead = (target_weekday - today.weekday() + 7) % 7
         if days_ahead == 0:
             days_ahead = 7
         task_date = (today + timedelta(days=days_ahead)).strftime("%d.%m.%Y")
-        existing_tasks = [t["Задача"] for t in tasks_ws.get_all_records() if t["Дата"] == task_date]
-        if row["Задача"] not in existing_tasks:
-            add_task(task_date, row["Категория"], row["Подкатегория"], row["Задача"], row["Время"], "", "повтор")
+        existing_tasks = [t.get("Задача") for t in tasks_ws.get_all_records() if t.get("Дата") == task_date]
+        if row.get("Задача") and row.get("Задача") not in existing_tasks:
+            add_task(task_date,
+                     row.get("Категория", ""),
+                     row.get("Подкатегория", ""),
+                     row.get("Задача", ""),
+                     row.get("Время", ""),
+                     "", "повтор")
 
 def send_daily_plan():
+    # Сначала добавляем повторяющиеся задачи на сегодня и планируем следующие
     process_repeating_tasks()
     schedule_next_repeat_tasks()
 
@@ -102,9 +120,17 @@ def send_daily_plan():
         if tasks:
             text = f"📅 План на {today}:\n\n"
             for i, t in enumerate(tasks, 1):
-                status_icon = "✅" if t["Статус"].lower() == "выполнено" else "⬜"
-                text += f"{status_icon} {i}. [{t['Категория']} - {t['Подкатегория']}] {t['Задача']} (до {t['Дедлайн']})\n"
-            bot.send_message(user["id"], text)
+                status = (t.get("Статус") or "").lower()
+                status_icon = "✅" if status == "выполнено" else "⬜"
+                cat = t.get("Категория", "")
+                sub = t.get("Подкатегория", "")
+                desc = t.get("Задача", "")
+                deadline = t.get("Дедлайн", "")
+                text += f"{status_icon} {i}. [{cat} - {sub}] {desc} (до {deadline})\n"
+            try:
+                bot.send_message(user["id"], text)
+            except Exception as e:
+                print(f"Ошибка при отправке плана пользователю {user['id']}: {e}")
 
 def send_reminders():
     now = datetime.now()
@@ -112,14 +138,19 @@ def send_reminders():
     for user in users:
         tasks = get_tasks_for_date(user["id"], datetime.now().strftime("%d.%m.%Y"))
         for t in tasks:
-            if not t["Статус"] or t["Статус"].lower() != "выполнено":
+            status = (t.get("Статус") or "").lower()
+            if status != "выполнено":
                 try:
-                    deadline = datetime.strptime(t["Дедлайн"], "%H:%M")
+                    dl = t.get("Дедлайн") or ""
+                    if not dl:
+                        continue
+                    deadline = datetime.strptime(dl, "%H:%M")
                     deadline_today = now.replace(hour=deadline.hour, minute=deadline.minute, second=0, microsecond=0)
                     if 0 <= (deadline_today - now).total_seconds() <= 1800:
-                        bot.send_message(user["id"], f"⚠️ Напоминание: {t['Задача']} (до {t['Дедлайн']})")
-                except:
-                    pass
+                        bot.send_message(user["id"], f"⚠️ Напоминание: {t.get('Задача','')} (до {dl})")
+                except Exception:
+                    # некорректный формат времени — пропускаем
+                    continue
 
 def send_evening_report():
     users = get_users()
@@ -127,32 +158,50 @@ def send_evening_report():
     for user in users:
         tasks = get_tasks_for_date(user["id"], today)
         if tasks:
-            done = [t for t in tasks if t["Статус"].lower() == "выполнено"]
-            undone = [t for t in tasks if not t["Статус"] or t["Статус"].lower() != "выполнено"]
-            text = f"🌙 Итог за {today}:
-
-"
+            done = [t for t in tasks if (t.get("Статус") or "").lower() == "выполнено"]
+            undone = [t for t in tasks if not (t.get("Статус") or "").lower() == "выполнено"]
+            text = f"🌙 Итог за {today}:\n\n"
             for t in done:
-                text += f"✅ {t['Задача']}\n"
+                text += f"✅ {t.get('Задача','')}\n"
             for t in undone:
-                text += f"🔄 Перенос: {t['Задача']}\n"
-                add_task((datetime.now() + timedelta(days=1)).strftime("%d.%m.%Y"), t["Категория"], t["Подкатегория"], t["Задача"], t["Дедлайн"], "", t["Повторяемость"])
-            bot.send_message(user["id"], text)
+                text += f"🔄 Перенос: {t.get('Задача','')}\n"
+                # переносим на завтра (сохраняем повторяемость)
+                add_task((datetime.now() + timedelta(days=1)).strftime("%d.%m.%Y"),
+                         t.get("Категория", ""),
+                         t.get("Подкатегория", ""),
+                         t.get("Задача", ""),
+                         t.get("Дедлайн", ""),
+                         "", t.get("Повторяемость", ""))
+            try:
+                bot.send_message(user["id"], text)
+            except Exception as e:
+                print(f"Ошибка при отправке вечернего отчета пользователю {user['id']}: {e}")
 
+# ====== КОМАНДЫ ======
 @bot.message_handler(commands=['done'])
 def mark_done(message):
     try:
-        task_num = int(message.text.split()[1]) - 1
+        parts = message.text.split()
+        if len(parts) < 2:
+            bot.send_message(message.chat.id, "Используй формат: /done 1")
+            return
+        task_num = int(parts[1]) - 1
         user_id = str(message.chat.id)
         tasks = get_tasks_for_date(user_id, datetime.now().strftime("%d.%m.%Y"))
         if 0 <= task_num < len(tasks):
-            cell = tasks_ws.find(tasks[task_num]["Задача"])
-            tasks_ws.update_cell(cell.row, 6, "выполнено")
-            bot.send_message(user_id, f"✅ Задача '{tasks[task_num]['Задача']}' выполнена!")
+            # находим первую ячейку с таким описанием (может быть несколько — берём первую)
+            task_desc = tasks[task_num].get("Задача")
+            cell = tasks_ws.find(task_desc)
+            if cell:
+                # колонка Статус — 6 (считаем: Дата(1),Категория(2),Подкат(3),Задача(4),Дедлайн(5),Статус(6))
+                tasks_ws.update_cell(cell.row, 6, "выполнено")
+                bot.send_message(user_id, f"✅ Задача '{task_desc}' отмечена как выполненная!")
+            else:
+                bot.send_message(user_id, "Не удалось найти задачу в таблице.")
         else:
             bot.send_message(user_id, "❌ Неверный номер задачи")
-    except:
-        bot.send_message(user_id, "Используй формат: /done 1")
+    except Exception:
+        bot.send_message(message.chat.id, "Используй формат: /done 1")
 
 # ====== ФУНКЦИИ ЗАПУСКА ======
 def run_scheduler():
@@ -164,7 +213,13 @@ def run_scheduler():
         time.sleep(1)
 
 def run_bot():
-    bot.polling(none_stop=True)
+    try:
+        bot.polling(none_stop=True)
+    except Exception as e:
+        print(f"Ошибка polling: {e}")
+        time.sleep(5)
+        # попытка перезапуска в случае падения
+        run_bot()
 
 # Flask веб-сервер для Render
 app = Flask(__name__)
@@ -174,6 +229,8 @@ def home():
     return "Bot is running!"
 
 if __name__ == "__main__":
-    threading.Thread(target=run_scheduler).start()
-    threading.Thread(target=run_bot).start()
+    # Запускаем планировщик и бота в отдельных потоках, а затем запускаем Flask
+    threading.Thread(target=run_scheduler, daemon=True).start()
+    threading.Thread(target=run_bot, daemon=True).start()
+    # Flask нужен Render, он будет держать процесс живым
     app.run(host="0.0.0.0", port=5000)
