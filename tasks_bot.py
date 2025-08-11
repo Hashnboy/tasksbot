@@ -3,13 +3,13 @@ import gspread
 import schedule
 import time
 import threading
+import re
 from datetime import datetime, timedelta
 from flask import Flask, request
 from telebot import types
-import os
 
 # ====== НАСТРОЙКИ ======
-API_TOKEN = "7959600917:AAF7szpbvX8CoFObxjVb6y3aCiSceCi-Rt4"
+API_TOKEN = "7959600917:AAF7szpbvX8CoFObxj1aCiSceCi-Rt4"
 TABLE_URL = "https://docs.google.com/spreadsheets/d/1lIV2kUx8sDHR1ynMB2di8j5n9rpj1ydhsmfjXJpRGeA/edit?usp=sharing"
 CREDENTIALS_FILE = "/etc/secrets/credentials.json"
 WEBHOOK_URL = "https://tasksbot-hy3t.onrender.com/" + API_TOKEN
@@ -22,7 +22,6 @@ sh = gc.open_by_url(TABLE_URL)
 
 tasks_ws = sh.worksheet("Задачи")
 users_ws = sh.worksheet("Пользователи")
-repeat_ws = sh.worksheet("Повторяющиеся задачи")
 
 # ====== ФУНКЦИИ ======
 def get_users():
@@ -65,7 +64,7 @@ def add_task(date, category, subcategory, task, deadline, user_id, status="", re
 # ====== КНОПКИ ======
 def main_menu():
     markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    markup.add("📅 Сегодня", "📆 Неделя", "🗓 Вся неделя")
+    markup.add("📅 Сегодня", "📆 Неделя", "🗓 Вся неделя", "➕ Добавить задачу")
     return markup
 
 def week_days_menu():
@@ -79,7 +78,66 @@ def week_days_menu():
     markup.add("⬅ Назад")
     return markup
 
-# ====== ОБРАБОТЧИКИ ======
+# ====== СТАТУС ПОЛЬЗОВАТЕЛЯ ДЛЯ ДОБАВЛЕНИЯ ЗАДАЧ ======
+user_steps = {}
+temp_task_data = {}
+
+# ====== ДОБАВЛЕНИЕ ЗАДАЧ С ПРОВЕРКОЙ ======
+@bot.message_handler(func=lambda msg: msg.text == "➕ Добавить задачу")
+def add_task_start(message):
+    user_steps[message.chat.id] = 'date'
+    temp_task_data[message.chat.id] = {}
+    bot.send_message(message.chat.id, "Введите дату задачи в формате ДД.ММ.ГГГГ:")
+
+@bot.message_handler(func=lambda m: user_steps.get(m.chat.id) == 'date')
+def get_task_date(message):
+    if not re.match(r"^\d{2}\.\d{2}\.\d{4}$", message.text):
+        bot.send_message(message.chat.id, "❌ Неверный формат даты! Введите в формате ДД.ММ.ГГГГ:")
+        return
+    temp_task_data[message.chat.id]['date'] = message.text
+    user_steps[message.chat.id] = 'category'
+    bot.send_message(message.chat.id, "Введите категорию:")
+
+@bot.message_handler(func=lambda m: user_steps.get(m.chat.id) == 'category')
+def get_task_category(message):
+    temp_task_data[message.chat.id]['category'] = message.text
+    user_steps[message.chat.id] = 'subcategory'
+    bot.send_message(message.chat.id, "Введите подкатегорию:")
+
+@bot.message_handler(func=lambda m: user_steps.get(m.chat.id) == 'subcategory')
+def get_task_subcategory(message):
+    temp_task_data[message.chat.id]['subcategory'] = message.text
+    user_steps[message.chat.id] = 'task'
+    bot.send_message(message.chat.id, "Введите описание задачи:")
+
+@bot.message_handler(func=lambda m: user_steps.get(m.chat.id) == 'task')
+def get_task_desc(message):
+    temp_task_data[message.chat.id]['task'] = message.text
+    user_steps[message.chat.id] = 'deadline'
+    bot.send_message(message.chat.id, "Введите дедлайн в формате ЧЧ:ММ:")
+
+@bot.message_handler(func=lambda m: user_steps.get(m.chat.id) == 'deadline')
+def get_task_deadline(message):
+    if not re.match(r"^\d{2}:\d{2}$", message.text):
+        bot.send_message(message.chat.id, "❌ Неверный формат времени! Введите в формате ЧЧ:ММ:")
+        return
+    temp_task_data[message.chat.id]['deadline'] = message.text
+    data = temp_task_data[message.chat.id]
+
+    add_task(
+        data['date'],
+        data['category'],
+        data['subcategory'],
+        data['task'],
+        data['deadline'],
+        message.chat.id
+    )
+
+    bot.send_message(message.chat.id, "✅ Задача добавлена!", reply_markup=main_menu())
+    user_steps.pop(message.chat.id, None)
+    temp_task_data.pop(message.chat.id, None)
+
+# ====== ОБРАБОТЧИКИ КНОПОК ======
 @bot.message_handler(commands=["start"])
 def start_cmd(message):
     bot.send_message(message.chat.id, "Добро пожаловать! Выберите действие:", reply_markup=main_menu())
