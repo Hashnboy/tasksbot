@@ -1,4 +1,0 @@
-pyTelegramBotAPI
-gspread
-schedule
-Flask
