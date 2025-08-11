@@ -10,7 +10,7 @@ from telebot import types
 from zoneinfo import ZoneInfo  # встроенный модуль Python 3.9+
 
 # ====== НАСТРОЙКИ ======
-API_TOKEN = "7959600917:AAF7szpbvX8CoFObxj1aCiSceCi-Rt4"
+API_TOKEN = "7959600917:AAF7szpbvX8CoFObxjVb6y3aCiSceCi-Rt4"
 TABLE_URL = "https://docs.google.com/spreadsheets/d/1lIV2kUx8sDHR1ynMB2di8j5n9rpj1ydhsmfjXJpRGeA/edit?usp=sharing"
 CREDENTIALS_FILE = "/etc/secrets/credentials.json"
 WEBHOOK_URL = "https://tasksbot-hy3t.onrender.com/" + API_TOKEN
