@@ -4,12 +4,11 @@ import schedule
 import time
 import threading
 from datetime import datetime, timedelta
-from flask import Flask, request
+from flask import Flask
 from telebot import types
 
 # ====== НАСТРОЙКИ ======
-API_TOKEN = "7959600917:AAF7szpbvX8CoFObxjVb6y3aCiSceCi-Rt4"
-WEBHOOK_URL = "https://tasksbot-hy3t.onrender.com"  # твой Render URL
+API_TOKEN = "ТВОЙ_ТОКЕН"
 TABLE_URL = "https://docs.google.com/spreadsheets/d/1lIV2kUx8sDHR1ynMB2di8j5n9rpj1ydhsmfjXJpRGeA/edit?usp=sharing"
 CREDENTIALS_FILE = "/etc/secrets/credentials.json"
 
@@ -21,31 +20,71 @@ sh = gc.open_by_url(TABLE_URL)
 
 tasks_ws = sh.worksheet("Задачи")
 users_ws = sh.worksheet("Пользователи")
+repeat_ws = sh.worksheet("Повторяющиеся задачи")
 
 # ====== ФУНКЦИИ ======
 def get_users():
     users = []
-    for row in users_ws.get_all_records():
+    rows = users_ws.get_all_records()
+    for row in rows:
         if row.get("Telegram ID"):
+            categories = []
+            raw = row.get("Категории задач") or ""
+            if raw:
+                categories = [c.strip() for c in raw.split(",") if c.strip()]
             users.append({
                 "name": row.get("Имя", ""),
-                "id": str(row.get("Telegram ID"))
+                "id": str(row.get("Telegram ID")),
+                "categories": categories
             })
     return users
 
 def get_tasks_for_date(user_id, date_str):
-    return [
-        row for row in tasks_ws.get_all_records()
-        if row.get("Дата") == date_str and str(row.get("User ID")) == str(user_id)
-    ]
+    tasks = []
+    rows = tasks_ws.get_all_records()
+    for row in rows:
+        if row.get("Дата") == date_str and str(row.get("User ID")) == str(user_id):
+            tasks.append(row)
+    return tasks
 
 def get_tasks_for_week(user_id):
     today = datetime.now()
     week_dates = [(today + timedelta(days=i)).strftime("%d.%m.%Y") for i in range(7)]
-    return [
-        row for row in tasks_ws.get_all_records()
-        if row.get("Дата") in week_dates and str(row.get("User ID")) == str(user_id)
-    ]
+    tasks = []
+    rows = tasks_ws.get_all_records()
+    for row in rows:
+        if row.get("Дата") in week_dates and str(row.get("User ID")) == str(user_id):
+            tasks.append(row)
+    return tasks
+
+def add_task(date, category, subcategory, task, deadline, user_id, status="", repeat=""):
+    tasks_ws.append_row([date, category, subcategory, task, deadline, status, repeat, user_id])
+
+def process_repeating_tasks():
+    today_str = datetime.now().strftime("%d.%m.%Y")
+    today_weekday = datetime.now().strftime("%A").lower()
+    weekday_map = {
+        "monday": "понедельник",
+        "tuesday": "вторник",
+        "wednesday": "среда",
+        "thursday": "четверг",
+        "friday": "пятница",
+        "saturday": "суббота",
+        "sunday": "воскресенье"
+    }
+    today_rus = weekday_map.get(today_weekday, "")
+
+    existing_tasks_today = [t.get("Задача") for t in tasks_ws.get_all_records() if t.get("Дата") == today_str]
+
+    for row in repeat_ws.get_all_records():
+        if (row.get("День недели") or "").strip().lower() == today_rus:
+            if row.get("Задача") and row.get("Задача") not in existing_tasks_today:
+                add_task(today_str,
+                         row.get("Категория", ""),
+                         row.get("Подкатегория", ""),
+                         row.get("Задача", ""),
+                         row.get("Время", ""),
+                         "", "повтор")
 
 # ====== КНОПКИ ======
 def main_menu():
@@ -115,46 +154,54 @@ def day_tasks(message):
 def back_to_main(message):
     bot.send_message(message.chat.id, "Главное меню:", reply_markup=main_menu())
 
-# ====== РАССЫЛКА НАПОМИНАНИЙ ======
-def send_reminders():
-    now = datetime.now()
-    for user in get_users():
-        tasks = get_tasks_for_date(user["id"], now.strftime("%d.%m.%Y"))
-        for t in tasks:
-            deadline = t.get("Дедлайн", "")
-            if not deadline:
-                continue
+# ====== ВЕЧЕРНИЙ ОТЧЕТ ======
+def send_evening_report():
+    users = get_users()
+    today = datetime.now().strftime("%d.%m.%Y")
+    tomorrow = (datetime.now() + timedelta(days=1)).strftime("%d.%m.%Y")
+    for user in users:
+        tasks = get_tasks_for_date(user["id"], today)
+        if tasks:
+            done = [t for t in tasks if (t.get("Статус") or "").lower() == "выполнено"]
+            undone = [t for t in tasks if not (t.get("Статус") or "").lower() == "выполнено"]
+            text = f"🌙 Итог за {today}:\n\n"
+            for t in done:
+                text += f"✅ {t.get('Задача','')}\n"
+            for t in undone:
+                text += f"🔄 Перенос: {t.get('Задача','')}\n"
+                add_task(
+                    tomorrow,
+                    t.get("Категория", ""),
+                    t.get("Подкатегория", ""),
+                    t.get("Задача", ""),
+                    t.get("Дедлайн", ""),
+                    user["id"],
+                    "",  # сброс статуса
+                    t.get("Повторяемость", "")
+                )
             try:
-                dl_time = datetime.strptime(deadline, "%H:%M").time()
-                if 0 <= (datetime.combine(now.date(), dl_time) - now).total_seconds() <= 1800:
-                    bot.send_message(user["id"], f"⚠️ Напоминание: {t.get('Задача','')} (до {deadline})")
-            except:
-                continue
+                bot.send_message(user["id"], text)
+            except Exception as e:
+                print(f"Ошибка при отправке вечернего отчета пользователю {user['id']}: {e}")
 
-# ====== SCHEDULER ======
+# ====== ФУНКЦИИ ЗАПУСКА ======
 def run_scheduler():
-    schedule.every(10).minutes.do(send_reminders)
+    schedule.every().day.at("09:00").do(lambda: print("Рассылка утренних задач"))
+    schedule.every().day.at("19:00").do(send_evening_report)
     while True:
         schedule.run_pending()
         time.sleep(1)
 
-# ====== FLASK ДЛЯ WEBHOOK ======
+def run_bot():
+    bot.polling(none_stop=True)
+
+# Flask сервер для Render
 app = Flask(__name__)
 
-@app.route("/", methods=["GET"])
-def index():
+@app.route("/")
+def home():
     return "Bot is running!"
 
-@app.route(f"/{API_TOKEN}", methods=["POST"])
-def webhook():
-    json_str = request.get_data().decode("UTF-8")
-    update = telebot.types.Update.de_json(json_str)
-    bot.process_new_updates([update])
-    return "OK", 200
-
 if __name__ == "__main__":
-    bot.remove_webhook()
-    bot.set_webhook(url=f"{WEBHOOK_URL}/{API_TOKEN}")
-
     threading.Thread(target=run_scheduler, daemon=True).start()
-    app.run(host="0.0.0.0", port=5000)
+    run_bot()
