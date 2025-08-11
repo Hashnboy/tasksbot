@@ -101,8 +101,6 @@ def send_daily_plan():
         tasks = get_tasks_for_date(user["id"], today)
         if tasks:
             text = f"📅 План на {today}:\n\n"
-
-"
             for i, t in enumerate(tasks, 1):
                 status_icon = "✅" if t["Статус"].lower() == "выполнено" else "⬜"
                 text += f"{status_icon} {i}. [{t['Категория']} - {t['Подкатегория']}] {t['Задача']} (до {t['Дедлайн']})\n"
