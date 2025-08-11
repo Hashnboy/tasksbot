@@ -229,8 +229,13 @@ def home():
     return "Bot is running!"
 
 if __name__ == "__main__":
-    # Запускаем планировщик и бота в отдельных потоках, а затем запускаем Flask
-    threading.Thread(target=run_scheduler, daemon=True).start()
-    threading.Thread(target=run_bot, daemon=True).start()
-    # Flask нужен Render, он будет держать процесс живым
+    # Запуск планировщика задач в отдельном потоке
+    scheduler_thread = threading.Thread(target=run_scheduler, daemon=True)
+    scheduler_thread.start()
+
+    # Запуск Telegram-бота в отдельном потоке
+    bot_thread = threading.Thread(target=run_bot, daemon=True)
+    bot_thread.start()
+
+    # Flask-сервер для Render
     app.run(host="0.0.0.0", port=5000)
