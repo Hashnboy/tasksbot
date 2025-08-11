@@ -6,12 +6,13 @@ import threading
 from datetime import datetime, timedelta
 from flask import Flask, request
 from telebot import types
+import os
 
 # ====== НАСТРОЙКИ ======
 API_TOKEN = "7959600917:AAF7szpbvX8CoFObxjVb6y3aCiSceCi-Rt4"
 TABLE_URL = "https://docs.google.com/spreadsheets/d/1lIV2kUx8sDHR1ynMB2di8j5n9rpj1ydhsmfjXJpRGeA/edit?usp=sharing"
 CREDENTIALS_FILE = "/etc/secrets/credentials.json"
-WEBHOOK_URL = f"https://tasksbot-hy3t.onrender.com/{API_TOKEN}"  # Render URL + токен
+WEBHOOK_URL = "https://tasksbot-hy3t.onrender.com/" + API_TOKEN
 
 bot = telebot.TeleBot(API_TOKEN)
 
@@ -130,33 +131,38 @@ def back_to_main(message):
     bot.send_message(message.chat.id, "Главное меню:", reply_markup=main_menu())
 
 # ====== ПЛАНИРОВЩИК ======
+def send_daily_plan():
+    today = datetime.now().strftime("%d.%m.%Y")
+    for user in get_users():
+        tasks = get_tasks_for_date(user["id"], today)
+        if tasks:
+            text = f"📅 План на {today}:\n\n"
+            for i, t in enumerate(tasks, 1):
+                text += f"{i}. {t.get('Задача','')} (до {t.get('Дедлайн','')})\n"
+            bot.send_message(user["id"], text)
+
 def run_scheduler():
-    schedule.every().day.at("09:00").do(lambda: print("Рассылка утренних задач"))
+    schedule.every().day.at("09:00").do(send_daily_plan)
     while True:
         schedule.run_pending()
         time.sleep(1)
 
-# ====== FLASK СЕРВЕР ДЛЯ WEBHOOK ======
+# ====== WEBHOOK ======
 app = Flask(__name__)
 
-@app.route(f"/{API_TOKEN}", methods=["POST"])
-def receive_update():
-    json_str = request.get_data().decode("UTF-8")
+@app.route("/" + API_TOKEN, methods=["POST"])
+def webhook():
+    json_str = request.get_data().decode("utf-8")
     update = telebot.types.Update.de_json(json_str)
     bot.process_new_updates([update])
     return "OK", 200
 
 @app.route("/")
-def index():
-    return "Bot is running via webhook!", 200
+def home():
+    return "Bot is running!"
 
 if __name__ == "__main__":
-    # Удаляем старый webhook и ставим новый
     bot.remove_webhook()
     bot.set_webhook(url=WEBHOOK_URL)
-
-    # Запуск планировщика в отдельном потоке
     threading.Thread(target=run_scheduler, daemon=True).start()
-
-    # Flask сервер (Render)
     app.run(host="0.0.0.0", port=5000)
