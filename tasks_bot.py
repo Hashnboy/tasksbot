@@ -100,7 +100,7 @@ def send_daily_plan():
     for user in users:
         tasks = get_tasks_for_date(user["id"], today)
         if tasks:
-            text = f"📅 План на {today}:
+            text = f"📅 План на {today}:\n\n"
 
 "
             for i, t in enumerate(tasks, 1):
