@@ -22,7 +22,7 @@ tasks_ws = sh.worksheet("Задачи")
 users_ws = sh.worksheet("Пользователи")
 repeat_ws = sh.worksheet("Повторяющиеся задачи")
 
-# ====== ФУНКЦИИ ======
+# ====== ПОЛУЧЕНИЕ ПОЛЬЗОВАТЕЛЕЙ ======
 def get_users():
     users = []
     rows = users_ws.get_all_records()
@@ -39,17 +39,27 @@ def get_users():
             })
     return users
 
+# ====== ДОБАВЛЕНИЕ НОВОГО ПОЛЬЗОВАТЕЛЯ ======
+def add_new_user(user_id, username):
+    users = get_users()
+    if not any(u["id"] == str(user_id) for u in users):
+        users_ws.append_row([username, str(user_id), ""])  # Имя, ID, Категории
+        print(f"Добавлен новый пользователь: {username} ({user_id})")
+
+# ====== ПОЛУЧЕНИЕ ЗАДАЧ ======
 def get_tasks_for_date(user_id, date_str):
     tasks = []
     rows = tasks_ws.get_all_records()
     for row in rows:
-        if row.get("Дата") == date_str and str(row.get("Пользователь ID", "")) == str(user_id):
+        if row.get("Дата") == date_str and str(row.get("Telegram ID")) == str(user_id):
             tasks.append(row)
     return tasks
 
-def add_task(date, category, subcategory, task, deadline, status="", repeat="", user_id=""):
+# ====== ДОБАВЛЕНИЕ ЗАДАЧ ======
+def add_task(date, category, subcategory, task, deadline, user_id, status="", repeat=""):
     tasks_ws.append_row([date, category, subcategory, task, deadline, status, repeat, str(user_id)])
 
+# ====== ОБРАБОТКА ПОВТОРЯЮЩИХСЯ ЗАДАЧ ======
 def process_repeating_tasks():
     today_str = datetime.now().strftime("%d.%m.%Y")
     today_weekday = datetime.now().strftime("%A").lower()
@@ -64,185 +74,120 @@ def process_repeating_tasks():
     }
     today_rus = weekday_map.get(today_weekday, "")
 
-    existing_tasks_today = [t.get("Задача") for t in tasks_ws.get_all_records() if t.get("Дата") == today_str]
-
     for row in repeat_ws.get_all_records():
         if (row.get("День недели") or "").strip().lower() == today_rus:
-            if row.get("Задача") and row.get("Задача") not in existing_tasks_today:
-                add_task(today_str,
-                         row.get("Категория", ""),
-                         row.get("Подкатегория", ""),
-                         row.get("Задача", ""),
-                         row.get("Время", ""),
-                         "", "повтор",
-                         row.get("Пользователь ID", ""))
-
-def schedule_next_repeat_tasks():
-    weekday_to_int = {
-        "понедельник": 0,
-        "вторник": 1,
-        "среда": 2,
-        "четверг": 3,
-        "пятница": 4,
-        "суббота": 5,
-        "воскресенье": 6
-    }
-    today = datetime.now()
-    for row in repeat_ws.get_all_records():
-        dow_raw = (row.get("День недели") or "").strip().lower()
-        if dow_raw not in weekday_to_int:
-            continue
-        target_weekday = weekday_to_int[dow_raw]
-        days_ahead = (target_weekday - today.weekday() + 7) % 7
-        if days_ahead == 0:
-            days_ahead = 7
-        task_date = (today + timedelta(days=days_ahead)).strftime("%d.%m.%Y")
-        existing_tasks = [t.get("Задача") for t in tasks_ws.get_all_records() if t.get("Дата") == task_date]
-        if row.get("Задача") and row.get("Задача") not in existing_tasks:
-            add_task(task_date,
+            add_task(today_str,
                      row.get("Категория", ""),
                      row.get("Подкатегория", ""),
                      row.get("Задача", ""),
                      row.get("Время", ""),
-                     "", "повтор",
-                     row.get("Пользователь ID", ""))
+                     row.get("Telegram ID", ""),  # теперь задачи привязаны к ID
+                     "", "повтор")
 
+# ====== ОТПРАВКА ПЛАНА ======
 def send_daily_plan():
     process_repeating_tasks()
-    schedule_next_repeat_tasks()
-
-    users = get_users()
     today = datetime.now().strftime("%d.%m.%Y")
-    for user in users:
+    for user in get_users():
         tasks = get_tasks_for_date(user["id"], today)
         if tasks:
             text = f"📅 План на {today}:\n\n"
             for i, t in enumerate(tasks, 1):
-                status = (t.get("Статус") or "").lower()
-                status_icon = "✅" if status == "выполнено" else "⬜"
-                cat = t.get("Категория", "")
-                sub = t.get("Подкатегория", "")
-                desc = t.get("Задача", "")
-                deadline = t.get("Дедлайн", "")
-                text += f"{status_icon} {i}. [{cat} - {sub}] {desc} (до {deadline})\n"
-            try:
-                bot.send_message(user["id"], text)
-            except Exception as e:
-                print(f"Ошибка при отправке плана пользователю {user['id']}: {e}")
+                status_icon = "✅" if (t.get("Статус") or "").lower() == "выполнено" else "⬜"
+                text += f"{status_icon} {i}. [{t.get('Категория','')} - {t.get('Подкатегория','')}] {t.get('Задача','')} (до {t.get('Дедлайн','')})\n"
+            bot.send_message(user["id"], text)
 
-def send_reminders():
-    now = datetime.now()
-    users = get_users()
-    for user in users:
-        tasks = get_tasks_for_date(user["id"], datetime.now().strftime("%d.%m.%Y"))
-        for t in tasks:
-            status = (t.get("Статус") or "").lower()
-            if status != "выполнено":
-                try:
-                    dl = t.get("Дедлайн") or ""
-                    if not dl:
-                        continue
-                    deadline = datetime.strptime(dl, "%H:%M")
-                    deadline_today = now.replace(hour=deadline.hour, minute=deadline.minute, second=0, microsecond=0)
-                    if 0 <= (deadline_today - now).total_seconds() <= 1800:
-                        bot.send_message(user["id"], f"⚠️ Напоминание: {t.get('Задача','')} (до {dl})")
-                except Exception:
-                    continue
-
-def send_evening_report():
-    users = get_users()
+# ====== КОМАНДА /today ======
+@bot.message_handler(commands=['today'])
+def today_tasks(message):
+    user_id = message.chat.id
+    add_new_user(user_id, message.from_user.first_name)
     today = datetime.now().strftime("%d.%m.%Y")
-    for user in users:
-        tasks = get_tasks_for_date(user["id"], today)
-        if tasks:
-            done = [t for t in tasks if (t.get("Статус") or "").lower() == "выполнено"]
-            undone = [t for t in tasks if not (t.get("Статус") or "").lower() == "выполнено"]
-            text = f"🌙 Итог за {today}:\n\n"
-            for t in done:
-                text += f"✅ {t.get('Задача','')}\n"
-            for t in undone:
-                text += f"🔄 Перенос: {t.get('Задача','')}\n"
-                add_task((datetime.now() + timedelta(days=1)).strftime("%d.%m.%Y"),
-                         t.get("Категория", ""),
-                         t.get("Подкатегория", ""),
-                         t.get("Задача", ""),
-                         t.get("Дедлайн", ""),
-                         "", t.get("Повторяемость", ""),
-                         user["id"])
-            try:
-                bot.send_message(user["id"], text)
-            except Exception as e:
-                print(f"Ошибка при отправке вечернего отчета пользователю {user['id']}: {e}")
+    tasks = get_tasks_for_date(user_id, today)
+    if not tasks:
+        bot.send_message(user_id, "📭 На сегодня задач нет!")
+        return
+    text = f"📅 Ваши задачи на сегодня:\n\n"
+    for i, t in enumerate(tasks, 1):
+        status_icon = "✅" if (t.get("Статус") or "").lower() == "выполнено" else "⬜"
+        text += f"{status_icon} {i}. [{t.get('Категория','')} - {t.get('Подкатегория','')}] {t.get('Задача','')} (до {t.get('Дедлайн','')})\n"
+    bot.send_message(user_id, text)
 
-# ====== КНОПКИ ======
+# ====== КОМАНДА /week ======
+@bot.message_handler(commands=['week'])
+def week_menu(message):
+    add_new_user(message.chat.id, message.from_user.first_name)
+    today = datetime.now()
+    keyboard = types.InlineKeyboardMarkup(row_width=1)
+    
+    for i in range(7):
+        day_date = today + timedelta(days=i)
+        day_name_rus = day_date.strftime("%A")
+        day_name_rus = {
+            "Monday": "Понедельник",
+            "Tuesday": "Вторник",
+            "Wednesday": "Среда",
+            "Thursday": "Четверг",
+            "Friday": "Пятница",
+            "Saturday": "Суббота",
+            "Sunday": "Воскресенье"
+        }[day_name_rus]
+        day_str = day_date.strftime("%d.%m.%Y")
+        btn = types.InlineKeyboardButton(f"{day_name_rus} ({day_str})", callback_data=f"day_{day_str}")
+        keyboard.add(btn)
+    
+    keyboard.add(types.InlineKeyboardButton("📅 Вся неделя", callback_data="week_all"))
+    bot.send_message(message.chat.id, "Выбери день или всю неделю:", reply_markup=keyboard)
+
+# ====== ОБРАБОТКА КНОПОК ======
+@bot.callback_query_handler(func=lambda call: call.data.startswith("day_") or call.data == "week_all")
+def callback_week(call):
+    user_id = str(call.message.chat.id)
+    if call.data.startswith("day_"):
+        date_str = call.data.replace("day_", "")
+        tasks = get_tasks_for_date(user_id, date_str)
+        if not tasks:
+            bot.send_message(user_id, f"📭 На {date_str} задач нет!")
+            return
+        text = f"📅 Ваши задачи на {date_str}:\n\n"
+        for i, t in enumerate(tasks, 1):
+            status_icon = "✅" if (t.get("Статус") or "").lower() == "выполнено" else "⬜"
+            text += f"{status_icon} {i}. [{t.get('Категория','')} - {t.get('Подкатегория','')}] {t.get('Задача','')} (до {t.get('Дедлайн','')})\n"
+        bot.send_message(user_id, text)
+    elif call.data == "week_all":
+        today = datetime.now()
+        text = "📅 Ваши задачи на неделю:\n\n"
+        has_tasks = False
+        for i in range(7):
+            date_str = (today + timedelta(days=i)).strftime("%d.%m.%Y")
+            tasks = get_tasks_for_date(user_id, date_str)
+            if tasks:
+                has_tasks = True
+                text += f"\n📆 {date_str}:\n"
+                for j, t in enumerate(tasks, 1):
+                    status_icon = "✅" if (t.get("Статус") or "").lower() == "выполнено" else "⬜"
+                    text += f"{status_icon} {j}. [{t.get('Категория','')} - {t.get('Подкатегория','')}] {t.get('Задача','')} (до {t.get('Дедлайн','')})\n"
+        if not has_tasks:
+            text = "📭 На неделю задач нет!"
+        bot.send_message(user_id, text)
+
+# ====== СТАРТ ======
 @bot.message_handler(commands=['start'])
 def start(message):
-    markup = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    btn1 = types.KeyboardButton("📋 Мой план на сегодня")
-    markup.add(btn1)
-    bot.send_message(message.chat.id, "Привет! Выбери действие:", reply_markup=markup)
-
-@bot.message_handler(func=lambda message: message.text == "📋 Мой план на сегодня")
-def send_my_plan(message):
-    today = datetime.now().strftime("%d.%m.%Y")
-    tasks = get_tasks_for_date(message.chat.id, today)
-    if tasks:
-        text = f"📅 Твой план на {today}:\n\n"
-        for i, t in enumerate(tasks, 1):
-            status = (t.get("Статус") or "").lower()
-            status_icon = "✅" if status == "выполнено" else "⬜"
-            cat = t.get("Категория", "")
-            sub = t.get("Подкатегория", "")
-            desc = t.get("Задача", "")
-            deadline = t.get("Дедлайн", "")
-            text += f"{status_icon} {i}. [{cat} - {sub}] {desc} (до {deadline})\n"
-        bot.send_message(message.chat.id, text)
-    else:
-        bot.send_message(message.chat.id, "✅ На сегодня задач нет!")
-
-# ====== ОТМЕТКА ВЫПОЛНЕНИЯ ======
-@bot.message_handler(commands=['done'])
-def mark_done(message):
-    try:
-        parts = message.text.split()
-        if len(parts) < 2:
-            bot.send_message(message.chat.id, "Используй формат: /done 1")
-            return
-        task_num = int(parts[1]) - 1
-        user_id = str(message.chat.id)
-        tasks = get_tasks_for_date(user_id, datetime.now().strftime("%d.%m.%Y"))
-        if 0 <= task_num < len(tasks):
-            task_desc = tasks[task_num].get("Задача")
-            cell = tasks_ws.find(task_desc)
-            if cell:
-                tasks_ws.update_cell(cell.row, 6, "выполнено")
-                bot.send_message(user_id, f"✅ Задача '{task_desc}' отмечена как выполненная!")
-            else:
-                bot.send_message(user_id, "Не удалось найти задачу в таблице.")
-        else:
-            bot.send_message(user_id, "❌ Неверный номер задачи")
-    except Exception:
-        bot.send_message(message.chat.id, "Используй формат: /done 1")
+    add_new_user(message.chat.id, message.from_user.first_name)
+    bot.send_message(message.chat.id, "Привет! Я бот задач.\nКоманды:\n/today - задачи на сегодня\n/week - задачи на неделю")
 
 # ====== ЗАПУСК ======
 def run_scheduler():
     schedule.every().day.at("09:00").do(send_daily_plan)
-    schedule.every(10).minutes.do(send_reminders)
-    schedule.every().day.at("19:00").do(send_evening_report)
     while True:
         schedule.run_pending()
         time.sleep(1)
 
 def run_bot():
-    try:
-        bot.remove_webhook()
-        bot.polling(none_stop=True)
-    except Exception as e:
-        print(f"Ошибка polling: {e}")
-        time.sleep(5)
-        run_bot()
+    bot.remove_webhook()
+    bot.polling(none_stop=True)
 
-# Flask веб-сервер для Render
 app = Flask(__name__)
 
 @app.route("/")
