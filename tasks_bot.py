@@ -7,7 +7,7 @@ from datetime import datetime, timedelta
 from flask import Flask
 
 # ====== НАСТРОЙКИ ======
-API_TOKEN = "YOUR_TELEGRAM_BOT_TOKEN"  # замените на свой токен
+API_TOKEN = "7959600917:AAF7szpbvX8CoFObxjVb6y3aCiSceCi-Rt4"  # замените на свой токен
 TABLE_URL = "https://docs.google.com/spreadsheets/d/1lIV2kUx8sDHR1ynMB2di8j5n9rpj1ydhsmfjXJpRGeA/edit?usp=sharing"
 CREDENTIALS_FILE = "credentials.json"
 
