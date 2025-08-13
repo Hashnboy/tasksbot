@@ -3,7 +3,6 @@ import re
 import json
 import time
 import pytz
-import queue
 import gspread
 import logging
 import schedule
@@ -12,53 +11,45 @@ from datetime import datetime, timedelta
 from flask import Flask, request
 from telebot import TeleBot, types
 
-# ========= НАСТРОЙКИ И ОКРУЖЕНИЕ =========
-# Все чувствительные данные берем из ENV
-API_TOKEN       = os.getenv("TELEGRAM_TOKEN")              # токен бота
-TABLE_URL       = os.getenv("GOOGLE_SHEETS_URL")           # URL таблицы
-CREDENTIALS_FILE= os.getenv("GOOGLE_CREDENTIALS_JSON", "/etc/secrets/credentials.json")
-WEBHOOK_BASE    = os.getenv("WEBHOOK_BASE")                 # например: https://tasksbot-hy3t.onrender.com
-OPENAI_API_KEY  = os.getenv("OPENAI_API_KEY")               # ключ OpenAI
+# ========= ОКРУЖЕНИЕ =========
+API_TOKEN        = os.getenv("TELEGRAM_TOKEN")
+WEBHOOK_BASE     = os.getenv("WEBHOOK_BASE")
+GOOGLE_SHEETS_URL= os.getenv("GOOGLE_SHEETS_URL")
+CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_JSON", "/etc/secrets/credentials.json")
+OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY")
 
-# Проверки окружения (мягкие: логируем, но не падаем)
-missing_env = []
-for var in ["TELEGRAM_TOKEN", "GOOGLE_SHEETS_URL", "WEBHOOK_BASE"]:
-    if not os.getenv(var):
-        missing_env.append(var)
-if missing_env:
-    print(f"[WARN] Не заданы переменные: {', '.join(missing_env)}")
+if not API_TOKEN or not WEBHOOK_BASE or not GOOGLE_SHEETS_URL:
+    print("[WARN] Не заданы переменные окружения: TELEGRAM_TOKEN / WEBHOOK_BASE / GOOGLE_SHEETS_URL")
 
-WEBHOOK_URL = f"{WEBHOOK_BASE}/{API_TOKEN}" if API_TOKEN and WEBHOOK_BASE else None
+WEBHOOK_URL = f"{WEBHOOK_BASE}/{API_TOKEN}"
 
-# Часовой пояс (подстрои под себя)
 LOCAL_TZ = pytz.timezone(os.getenv("TZ", "Europe/Moscow"))
 
-# Логирование (в stdout для Render)
+# ========= ЛОГИ =========
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("tasksbot")
 
-# ========= ИНИЦИАЛИЗАЦИЯ БОТА / SHEETS =========
+# ========= БОТ / SHEETS =========
 bot = TeleBot(API_TOKEN, parse_mode="HTML")
-
 gc = gspread.service_account(filename=CREDENTIALS_FILE)
-sh = gc.open_by_url(TABLE_URL)
+sh = gc.open_by_url(GOOGLE_SHEETS_URL)
 
-# Ожидаем, что у тебя есть листы:
-# "Все задачи", "Повторяющиеся задачи", "Поставщики", "Словарь ТТ", "Пользователи", "Логи"
-ws_tasks       = sh.worksheet("Все задачи")
-ws_repeating   = sh.worksheet("Повторяющиеся задачи")
-ws_suppliers   = sh.worksheet("Поставщики")
-ws_tt_dict     = sh.worksheet("Словарь ТТ")
-ws_users       = sh.worksheet("Пользователи")
-ws_logs        = sh.worksheet("Логи")
+# Основные листы
+ws_tasks = sh.worksheet("Все задачи")
+ws_users = sh.worksheet("Пользователи")
+ws_logs  = sh.worksheet("Логи")
+# Поставщики не обязательны, но если есть — поможем ассистенту
+try:
+    ws_suppliers = sh.worksheet("Поставщики")
+except Exception:
+    ws_suppliers = None
 
-# Колонки для "Все задачи"
-# Дата | Направление | Категория | ТТ | Задача | Дедлайн | Статус | Тип | Повтор ID | User ID | Метки
-TASKS_HEADERS = ["Дата","Направление","Категория","ТТ","Задача","Дедлайн","Статус","Тип","Повтор ID","User ID","Метки"]
+# ========= КОНСТАНТЫ =========
+# «Все задачи» — строгий порядок колонок:
+TASK_COLS = ["Дата","Категория","Подкатегория","Задача","Дедлайн","User ID","Статус","Повторяемость","Источник"]
 
-# Колонки для "Повторяющиеся задачи"
-# Правило | Направление | Категория | ТТ | Задача | Время | Поставщик | User ID | Активна
-REPEAT_HEADERS = ["Правило","Направление","Категория","ТТ","Задача","Время","Поставщик","User ID","Активна"]
+WEEKDAYS_RU = ["понедельник","вторник","среда","четверг","пятница","суббота","воскресенье"]
+WEEKDAYS_RU_FULL = ["Понедельник","Вторник","Среда","Четверг","Пятница","Суббота","Воскресенье"]
 
 # ========= УТИЛИТЫ =========
 def now_local():
@@ -67,9 +58,8 @@ def now_local():
 def today_str():
     return now_local().strftime("%d.%m.%Y")
 
-def weekday_ru(dt: datetime) -> str:
-    mapping = ["Понедельник","Вторник","Среда","Четверг","Пятница","Суббота","Воскресенье"]
-    return mapping[dt.weekday()]
+def weekday_full(dt: datetime) -> str:
+    return WEEKDAYS_RU_FULL[dt.weekday()]
 
 def log_event(user_id, action, payload=""):
     try:
@@ -77,659 +67,710 @@ def log_event(user_id, action, payload=""):
     except Exception as e:
         log.error(f"Логи недоступны: {e}")
 
-def read_all(ws):
-    rows = ws.get_all_records()
-    return rows
+def get_all(ws):
+    return ws.get_all_records()
 
-def ensure_headers(ws, expected_headers):
+def ensure_headers(ws, expected):
     try:
-        headers = ws.row_values(1)
-        if headers != expected_headers:
-            log.warning(f"Заголовки листа {ws.title} не совпадают с ожидаемыми.\nОжидались: {expected_headers}\nФактически: {headers}")
+        hdr = ws.row_values(1)
+        if hdr != expected:
+            log.warning(f"Лист {ws.title}: ожидались заголовки {expected}, фактически {hdr}")
     except Exception as e:
-        log.error(f"Не смогли проверить заголовки {ws.title}: {e}")
+        log.error(f"Проверка заголовков {ws.title} не удалась: {e}")
 
-ensure_headers(ws_tasks, TASKS_HEADERS)
-ensure_headers(ws_repeating, REPEAT_HEADERS)
+ensure_headers(ws_tasks, TASK_COLS)
 
-# Направления/ТТ из словаря
-def load_tt():
-    tt_rows = read_all(ws_tt_dict)
-    # Структура строк предполагается: Направление | ТТ
-    tt_map = {}
-    for r in tt_rows:
-        direction = (r.get("Направление") or "").strip()
-        tt = (r.get("ТТ") or "").strip()
-        if direction and tt:
-            tt_map.setdefault(direction.lower(), set()).add(tt)
-    return tt_map
-
-TT_MAP = load_tt()
-
-def direction_for_supplier(supplier_name: str) -> str:
-    """Ищем направление поставщика в листе Поставщики."""
-    name = (supplier_name or "").strip().lower()
-    for r in read_all(ws_suppliers):
-        if (r.get("Поставщик") or "").strip().lower() == name:
-            return (r.get("Направление") or "").strip()
-    return ""
-
-# ========= ПРАВИЛА ПОСТАВЩИКОВ =========
-# К-Экспро: бесплатная "качель": сегодня заказ → завтра поставка → послезавтра снова заказ (каждые 2 дня)
-# ИП Вылегжанина (Кухня): заказ сегодня → поставка завтра → срок 72ч → новый заказ через 2 дня после поставки
-SUPPLIER_RULES = {
-    "к-экспро": {
-        "kind": "cycle_every_n_days",
-        "order_every_days": 2,      # каждые 2 дня ставить заказ
-        "delivery_offset_days": 1,  # поставка на следующий день после заказа
-        "order_deadline": "14:00",  # дедлайн по умолчанию
-        "emoji": "📦"
-    },
-    "ип вылегжанина": {
-        "kind": "delivery_shelf_then_order",
-        "delivery_offset_days": 1,   # поставка завтра
-        "shelf_hours": 72,           # хранение 72ч
-        "order_deadline": "14:00",
-        "emoji": "🥘"
+# ========= НАСТРОЙКИ ПОЛЬЗОВАТЕЛЯ =========
+def get_user_settings(user_id):
+    """Читает настройки из листа Пользователи. Возвращает дефолты если строка не найдена."""
+    defaults = {
+        "digest_on": True,
+        "digest_time": "08:00",
+        "reminders_on": True,
+        "remind_before_min": 30,
+        "name": ""
     }
-}
+    try:
+        for r in get_all(ws_users):
+            uid = str(r.get("Telegram ID") or "").strip()
+            if uid == str(user_id):
+                digest_on = str(r.get("Утренний дайджест","да")).strip().lower() in ("да","1","y","true","on")
+                digest_time = (r.get("Время дайджеста") or "08:00").strip()
+                reminders_on = str(r.get("Напоминания","да")).strip().lower() in ("да","1","y","true","on")
+                before = r.get("За сколько мин напоминать")
+                try:
+                    before = int(before)
+                except:
+                    before = 30
+                return {
+                    "digest_on": digest_on,
+                    "digest_time": digest_time,
+                    "reminders_on": reminders_on,
+                    "remind_before_min": before,
+                    "name": (r.get("Имя") or "").strip()
+                }
+    except Exception as e:
+        log.error(f"Не удалось прочитать настройки пользователя: {e}")
+    return defaults
 
-def normalize_supplier(name: str) -> str:
-    s = (name or "").strip().lower()
-    # частые варианты
-    s = s.replace("к-экспро","к-экспро").replace("k-exp", "к-экспро")
-    s = s.replace("ип вылегжанина","ип вылегжанина")
-    return s
+def set_user_setting(user_id, field, value):
+    """Пишет одну настройку в лист Пользователи, создаёт строку если нет."""
+    try:
+        rows = ws_users.get_all_records()
+        target_row = None
+        for idx, r in enumerate(rows, start=2):  # данные начинаются со 2 строки
+            if str(r.get("Telegram ID") or "").strip() == str(user_id):
+                target_row = idx
+                break
+        # Если нет — создадим
+        if not target_row:
+            ws_users.append_row([str(user_id), "", "да", "08:00", "да", 30], value_input_option="USER_ENTERED")
+            target_row = len(rows) + 2
 
-# ========= ДОБАВЛЕНИЕ ЗАДАЧ =========
-def add_task_row(date_str, direction, category, tt, text, deadline, status, ttype, repeat_id, user_id, tags=""):
-    row = [date_str, direction, category, tt, text, deadline, status, ttype, repeat_id, str(user_id), tags]
+        headers = ws_users.row_values(1)
+        if field not in headers:
+            # если новой колонки нет — добавлять не будем, просто лог
+            log.warning(f"Нет колонки '{field}' в листе Пользователи")
+            return
+        col = headers.index(field) + 1
+        ws_users.update_cell(target_row, col, value)
+    except Exception as e:
+        log.error(f"Не удалось сохранить настройку пользователя: {e}")
+
+# ========= ЧТЕНИЕ / ЗАПИСЬ ЗАДАЧ =========
+def add_task(date_s, category, subcategory, text, deadline, user_id, status="", repeat="", source=""):
+    row = [date_s, category, subcategory, text, deadline, str(user_id), status, repeat, source]
     ws_tasks.append_row(row, value_input_option="USER_ENTERED")
 
-def mark_done_by_index(user_id, date_str, index_1based):
-    rows = ws_tasks.get_all_records()
-    same_day = [r for r in rows if (r.get("User ID") and str(r.get("User ID")) == str(user_id)) and (r.get("Дата") == date_str)]
-    if 1 <= index_1based <= len(same_day):
-        target = same_day[index_1based-1]
-        # Найдем строку по уникальному набору: дата+текст+user (надежней — find, но ок)
-        cell = ws_tasks.find(target["Задача"])
-        if cell:
-            ws_tasks.update_cell(cell.row, TASKS_HEADERS.index("Статус")+1, "выполнено")
-            return target
+def tasks_for_date(user_id, date_s):
+    return [r for r in get_all(ws_tasks) if str(r.get("User ID")) == str(user_id) and (r.get("Дата") or "") == date_s]
+
+def tasks_for_week(user_id, base_date=None):
+    if base_date is None:
+        base_date = now_local().date()
+    days = {(base_date + timedelta(days=i)).strftime("%d.%m.%Y") for i in range(7)}
+    return [r for r in get_all(ws_tasks) if str(r.get("User ID")) == str(user_id) and (r.get("Дата") or "") in days]
+
+def find_row_by_unique(date_s, text, user_id):
+    # Находим первую строку по Дата+Задача+User ID
+    try:
+        cell = ws_tasks.find(text)
+        if not cell:
+            return None
+        # проверим совпадение по дате и юзеру для найденной строки
+        row_vals = ws_tasks.row_values(cell.row)
+        hdr = ws_tasks.row_values(1)
+        row = dict(zip(hdr, row_vals))
+        if row.get("Дата") == date_s and str(row.get("User ID")) == str(user_id):
+            return cell.row
+    except Exception:
+        return None
     return None
 
-def mark_done_by_text(user_id, supplier=None, tt=None, match_all=False):
-    """Помечает задачи сегодня по текстовому вводу, например:
-       'я сделал заказы к-экспро центр', 'я сделал все заказы к-экспро'
-    """
-    supplier_key = normalize_supplier(supplier or "")
+def mark_done_by_supplier_today(user_id, supplier_key, point=None, match_all=False):
+    """Пометить как выполненные «сегодня» задачи по поставщику (и ТТ), вернуть список изменённых."""
+    supplier_key = (supplier_key or "").strip().lower()
     today = today_str()
-    rows = ws_tasks.get_all_records()
     changed = []
-
-    for r in rows:
-        if str(r.get("User ID")) != str(user_id):
+    for r in get_all(ws_tasks):
+        if str(r.get("User ID")) != str(user_id): continue
+        if (r.get("Дата") or "") != today: continue
+        task_text = (r.get("Задача") or "").lower()
+        src = (r.get("Источник") or "").strip().lower()
+        # распознаём: по тексту и/или источнику
+        hit_text = supplier_key and supplier_key in task_text
+        if not hit_text and supplier_key in ("к-экспро","ип вылегжанина"):
+            hit_text = supplier_key in task_text
+        if not hit_text:
             continue
-        if r.get("Дата") != today:
+        if point:
+            pt = point.strip().lower()
+            # точка может быть в подкатегории или в тексте
+            tt_text = (r.get("Подкатегория") or "").strip().lower()
+            if pt not in tt_text and pt not in task_text:
+                continue
+        if (r.get("Статус") or "").lower() == "выполнено":
             continue
-        text = (r.get("Задача") or "").lower()
-        tt_row = (r.get("ТТ") or "").strip().lower()
-        if supplier_key and supplier_key not in text:
-            continue
-        if tt and (tt_row != tt.strip().lower()):
-            continue
-        if r.get("Статус","").lower() == "выполнено":
-            continue
-        # апдейтим статус
-        cell = ws_tasks.find(r["Задача"])
-        if cell:
-            ws_tasks.update_cell(cell.row, TASKS_HEADERS.index("Статус")+1, "выполнено")
+        row_idx = find_row_by_unique(today, r.get("Задача") or "", user_id)
+        if row_idx:
+            ws_tasks.update_cell(row_idx, TASK_COLS.index("Статус")+1, "выполнено")
             changed.append(r)
             if not match_all:
                 break
-
     return changed
 
-# ========= ГЕНЕРАЦИЯ ПО ПРАВИЛАМ ПОСТАВЩИКОВ =========
-def plan_next_by_supplier_rule(user_id, supplier_name, direction, tt_list):
-    key = normalize_supplier(supplier_name)
-    rule = SUPPLIER_RULES.get(key)
-    if not rule:
-        return []
-
-    created = []
-    today = now_local().date()
-    today_s = today.strftime("%d.%m.%Y")
-
-    if rule["kind"] == "cycle_every_n_days":
-        # Сегодня заказ (уже отмечен done) → ставим приемку на завтра, и новый заказ через 2 дня
-        delivery_day = today + timedelta(days=rule["delivery_offset_days"])
-        new_order_day = today + timedelta(days=rule["order_every_days"])
-        for tt in tt_list:
-            # приемка
-            add_task_row(delivery_day.strftime("%d.%m.%Y"), direction, "Поставка", tt,
-                         f"{rule['emoji']} Приемка {supplier_name} ({tt})", "10:00", "", "разовая", "", user_id, "приемка")
-            # новый заказ
-            add_task_row(new_order_day.strftime("%d.%m.%Y"), direction, "Закупка", tt,
-                         f"{rule['emoji']} Заказ {supplier_name} ({tt})", rule["order_deadline"], "", "разовая", "", user_id, "авто")
-            created.append((tt, delivery_day, new_order_day))
-
-    elif rule["kind"] == "delivery_shelf_then_order":
-        # Сегодня заказ (done) → завтра приемка → через 2 дня после приемки новый заказ
-        delivery_day = today + timedelta(days=rule["delivery_offset_days"])
-        next_order_day = delivery_day + timedelta(days=2)  # 48ч после доставки (из 72ч логика: заказ за день до конца)
-        for tt in tt_list:
-            add_task_row(delivery_day.strftime("%d.%m.%Y"), direction, "Поставка", tt,
-                         f"{rule['emoji']} Приемка {supplier_name} ({tt})", "11:00", "", "разовая", "", user_id, "приемка")
-            add_task_row(next_order_day.strftime("%d.%m.%Y"), direction, "Закупка", tt,
-                         f"{rule['emoji']} Заказ {supplier_name} ({tt})", rule["order_deadline"], "", "разовая", "", user_id, "авто")
-            created.append((tt, delivery_day, next_order_day))
-    return created
-
-# ========= GPT ПАРСИНГ ВВОДА =========
-def ai_parse_free_text(text, fallback_user_id):
+# ========= РАСШИРЕНИЕ ПОВТОРОВ =========
+def expand_repeats_for_date(target_dt: datetime):
     """
-    Возвращает список задач (обычных и/или повторяющихся) в унифицированном виде:
-    {
-      "kind": "single" | "repeat",
-      "date": "ДД.ММ.ГГГГ" (для single) или null,
-      "time": "ЧЧ:ММ" | "",
-      "direction": "Кофейня" | "Табачка" | "WB" | "Личное",
-      "category": "Закупка" | "Поставка" | "...",
-      "tt": "Центр" | "Полет" | "Климово" | "" (может быть список через ',' для множественных ТТ),
-      "text": "Описание задачи",
-      "repeat_rule": "каждые 2 дня / каждый вторник 12:00 / по пн,ср" (для repeat),
-      "supplier": "К-Экспро" | "ИП Вылегжанина" | "",
-      "user_id": fallback_user_id
-    }
+    Создаёт задачи на дату target_dt из «шаблонов» в листе «Все задачи».
+    Шаблон = строка, где Дата == "" и заполнено поле «Повторяемость».
+    Поддерживаются:
+      - «каждые N дней HH:MM» (по эпохе 2025-01-01)
+      - «каждый вторник HH:MM» / «каждый четверг»
+      - «по пн,ср,пт HH:MM»
+      - «к-экспро», «ип вылегжанина» — спец-правила (ниже)
     """
-    items = []
+    date_s = target_dt.strftime("%d.%m.%Y")
+    weekday = WEEKDAYS_RU[target_dt.weekday()]  # 'среда'
+    epoch = datetime(2025,1,1, tzinfo=LOCAL_TZ).date()
 
-    # 1) Попробуем OpenAI (если доступен)
-    used_ai = False
-    if OPENAI_API_KEY:
-        try:
-            from openai import OpenAI
-            client = OpenAI(api_key=OPENAI_API_KEY)
-            sys = (
-                "Ты парсер задач. Верни JSON-массив объектов (без текста вне JSON). "
-                "Каждый объект со схемой: "
-                "{kind, date, time, direction, category, tt, text, repeat_rule, supplier}. "
-                "kind: 'single' или 'repeat'. date = 'ДД.ММ.ГГГГ' для single, иначе ''. "
-                "time = 'ЧЧ:ММ' или ''. direction из {Кофейня, Табачка, WB, Личное}. "
-                "tt из {Центр, Полет, Климово, ''}. supplier укажи если узнаешь. "
-                "repeat_rule в человекочитаемом виде (например 'каждые 2 дня 14:00' или 'каждый вторник 12:00'). "
-                "Если встречаются обе точки, сделай 2 объекта: для Центр и для Полет. "
-                "Если текст про К-Экспро или ИП Вылегжанина, проставь supplier и category='Закупка'. "
-                "Если из текста неясно дата/время — ставь пустые строки."
-            )
-            prompt = f"Текст: {text}"
-            resp = client.chat.completions.create(
-                model="gpt-4o-mini",
-                messages=[
-                    {"role":"system", "content": sys},
-                    {"role":"user", "content": prompt}
-                ],
-                temperature=0.2
-            )
-            raw = resp.choices[0].message.content.strip()
-            # Ожидаем чистый JSON массив
-            parsed = json.loads(raw)
-            if isinstance(parsed, dict):
-                parsed = [parsed]
-            if isinstance(parsed, list):
-                for it in parsed:
-                    it["user_id"] = fallback_user_id
-                items = parsed
-                used_ai = True
-        except Exception as e:
-            log.error(f"AI parse failed: {e}")
+    existing = {(r.get("User ID"), r.get("Дата"), r.get("Задача")) for r in get_all(ws_tasks)}
 
-    # 2) Фоллбек-простой разбор, если AI недоступен/ошибся
-    if not used_ai:
-        # Простые эвристики:
-        text_l = text.lower()
-        direction = "Кофейня" if any(w in text_l for w in ["кофей", "к-экспро", "вылегжанин"]) else ("Табачка" if "табач" in text_l else "Личное")
-        supplier = ""
-        if "к-экспро" in text_l or "k-exp" in text_l:
-            supplier = "К-Экспро"
-        if "вылегжан" in text_l:
-            supplier = "ИП Вылегжанина"
-
-        # ТТ
-        tts = []
-        if "центр" in text_l: tts.append("Центр")
-        if "полет" in text_l or "полёт" in text_l: tts.append("Полет")
-        if "климов" in text_l: tts.append("Климово")
-        if not tts and direction in ("Кофейня","Табачка"):
-            tts = ["Центр"]
-
-        # время
-        m = re.search(r"(\d{1,2}:\d{2})", text)
-        time_s = m.group(1) if m else ""
-
-        # повтор
-        repeat_rule = ""
-        if "каждые 2 дня" in text_l or "каждый второй день" in text_l:
-            repeat_rule = f"каждые 2 дня {time_s}".strip()
-
-        # дата (если есть сегодня/завтра/конкретная)
-        date_s = ""
-        if "сегодня" in text_l:
-            date_s = now_local().strftime("%d.%m.%Y")
-        elif "завтра" in text_l:
-            date_s = (now_local()+timedelta(days=1)).strftime("%d.%m.%Y")
-        else:
-            m = re.search(r"(\d{2}\.\d{2}\.\d{4})", text)
-            if m: date_s = m.group(1)
-
-        base = {
-            "kind": "repeat" if repeat_rule else "single",
-            "date": date_s,
-            "time": time_s,
-            "direction": direction,
-            "category": "Закупка" if supplier else "Общее",
-            "tt": ",".join(tts),
-            "text": text.strip(),
-            "repeat_rule": repeat_rule,
-            "supplier": supplier,
-            "user_id": fallback_user_id
-        }
-
-        # если в тексте упомянуты обе точки — разложим
-        if len(tts) > 1:
-            for t in tts:
-                x = dict(base)
-                x["tt"] = t
-                items.append(x)
-        else:
-            items.append(base)
-
-    return items
-
-# ========= ОБРАБОТКА ПОВТОРЯЮЩИХСЯ ЗАДАЧ КАЖДЫЙ ДЕНЬ =========
-def expand_repeats_for_date(date_dt: datetime):
-    """На указанную дату создать задачи из листа 'Повторяющиеся задачи' по их правилам."""
-    date_s = date_dt.strftime("%d.%m.%Y")
-    weekday_map = ["понедельник","вторник","среда","четверг","пятница","суббота","воскресенье"]
-    weekday_s = weekday_map[date_dt.weekday()]
-    rep_rows = read_all(ws_repeating)
-
-    # Уже существующие задачи на дату для защиты от дублей
-    existing = {(r.get("User ID"), r.get("Дата"), r.get("Задача")) for r in ws_tasks.get_all_records()}
-
-    for r in rep_rows:
-        if (r.get("Активна") or "").strip().lower() not in ("1","да","true","y","on"):
+    for r in get_all(ws_tasks):
+        if (r.get("Дата") or "").strip():
+            continue  # это не шаблон
+        rule = (r.get("Повторяемость") or "").strip().lower()
+        if not rule:
             continue
-        rule = (r.get("Правило") or "").strip().lower()
-        direction = (r.get("Направление") or "").strip()
-        category = (r.get("Категория") or "").strip()
-        tt = (r.get("ТТ") or "").strip()
-        text = (r.get("Задача") or "").strip()
-        time_s = (r.get("Время") or "").strip()
-        supplier = (r.get("Поставщик") or "").strip()
         user_id = str(r.get("User ID") or "").strip()
+        cat = (r.get("Категория") or "").strip()
+        subcat = (r.get("Подкатегория") or "").strip()
+        text = (r.get("Задача") or "").strip()
+        deadline = (r.get("Дедлайн") or "").strip()
+        source = (r.get("Источник") or "").strip()
 
         should_create = False
+        time_part = ""
 
-        # Примеры правил: "каждые 2 дня 14:00", "каждый вторник 12:00", "по пн,ср"
-        if rule.startswith("каждые "):
-            # каждые N дней
-            m = re.search(r"каждые\s+(\d+)\s+дн", rule)
+        # спец-логика поставщиков — генерим «сегодня заказ» по шаблону дня
+        if rule in ("к-экспро","кэкспро","к-экcпро","k-exp","kexp","к экспро"):
+            # Ритм: заказ -> на след.день приемка -> ещё через день снова заказ
+            # Шаблон интерпретируем как «каждые 2 дня», ориентируясь на эпоху
+            days_since = (target_dt.date() - epoch).days
+            if days_since % 2 == 0:
+                should_create = True
+                time_part = deadline or "14:00"
+        elif "вылегжан" in rule:
+            # Вылегжанина: заказ -> на след.день приемка -> через 2 дня новый заказ
+            # Ставим заказы через день после приемки: итого каждые 3 дня цикл заказов
+            days_since = (target_dt.date() - epoch).days
+            if days_since % 3 == 0:
+                should_create = True
+                time_part = deadline or "14:00"
+        elif rule.startswith("каждые "):
+            m = re.search(r"каждые\s+(\d+)\s*дн", rule)
             if m:
                 n = int(m.group(1))
-                # базовый старт — из "с момента занесения". Будем делить от известной эпохи:
-                epoch = datetime(2025,1,1, tzinfo=LOCAL_TZ).date()
-                delta = (date_dt.date() - epoch).days
-                if delta % n == 0:
+                days_since = (target_dt.date() - epoch).days
+                if days_since % n == 0:
                     should_create = True
+            m2 = re.search(r"(\d{1,2}:\d{2})", rule)
+            if m2:
+                time_part = m2.group(1)
         elif rule.startswith("каждый "):
-            # каждый вторник, каждый четверг 14:00
-            for i,wd in enumerate(weekday_map):
-                if wd in rule and wd == weekday_s:
+            # «каждый четверг 12:00»
+            for wd in WEEKDAYS_RU:
+                if wd in rule and wd == weekday:
                     should_create = True
                     break
+            m2 = re.search(r"(\d{1,2}:\d{2})", rule)
+            if m2:
+                time_part = m2.group(1)
         elif rule.startswith("по "):
-            # по пн,ср
-            days = [d.strip() for d in rule.replace("по","").split(",")]
-            # сопоставим русские сокращения
+            # «по пн,ср,пт 10:30»
             short = {"пн":"понедельник","вт":"вторник","ср":"среда","чт":"четверг","пт":"пятница","сб":"суббота","вс":"воскресенье"}
+            days = [d.strip() for d in rule.replace("по","").split(",")]
             expanded = [short.get(d, d) for d in days]
-            if weekday_s in expanded:
+            if weekday in expanded:
                 should_create = True
+            m2 = re.search(r"(\d{1,2}:\d{2})", rule)
+            if m2:
+                time_part = m2.group(1)
 
         if should_create:
             key = (user_id, date_s, text)
             if key not in existing:
-                add_task_row(date_s, direction, category, tt, text, time_s, "", "повтор", "", user_id, "повтор")
+                add_task(date_s, cat, subcat, text, time_part, user_id, "", "авто", source)
                 existing.add(key)
 
-# ========= ФОРМАТИРОВАННЫЙ ВЫВОД =========
-def format_tasks_grouped(tasks, header_date=None):
-    """Группировка: Направление → Категория → ТТ → пункты"""
+# ========= ФОРМАТИРОВАНИЕ ВЫВОДА =========
+def format_grouped(tasks, header_date=None):
     if not tasks:
         return "Задач нет."
-
-    # сортируем: направление, категория, ТТ, дедлайн
+    # Сортировка: Источник → Категория → Подкатегория → Дедлайн
     def k(r):
         dl = r.get("Дедлайн") or ""
         try:
-            dl_k = datetime.strptime(dl, "%H:%M").time()
+            t = datetime.strptime(dl,"%H:%M").time()
         except:
-            dl_k = datetime.min.time()
-        return (r.get("Направление",""), r.get("Категория",""), r.get("ТТ",""), dl_k, r.get("Задача",""))
-
+            t = datetime.min.time()
+        return ((r.get("Источник") or ""), (r.get("Категория") or ""), (r.get("Подкатегория") or ""), t, (r.get("Задача") or ""))
     tasks = sorted(tasks, key=k)
 
     out = []
     if header_date:
-        # В заголовке показываем день недели слева от даты
         dt = datetime.strptime(header_date, "%d.%m.%Y")
-        out.append(f"• {weekday_ru(dt)} — {header_date}\n")
+        out.append(f"• {weekday_full(dt)} — {header_date}\n")
 
-    # группировка
-    cur_dir = cur_cat = cur_tt = None
+    cur_src = cur_cat = cur_sub = None
     for r in tasks:
-        d = r.get("Направление","")
-        c = r.get("Категория","")
-        t = r.get("ТТ","")
-        txt = r.get("Задача","")
-        dl = r.get("Дедлайн","") or ""
-        st = (r.get("Статус","") or "").lower()
-        rep = (r.get("Тип","") or "").lower() == "повтор"
+        src = (r.get("Источник") or "").capitalize() or "—"
+        cat = (r.get("Категория") or "")
+        sub = (r.get("Подкатегория") or "") or "—"
+        txt = (r.get("Задача") or "")
+        dl  = (r.get("Дедлайн") or "")
+        st  = (r.get("Статус") or "").lower()
+        rep = (r.get("Повторяемость") or "").strip() != ""
+
         icon = "✅" if st == "выполнено" else ("🔁" if rep else "⬜")
 
-        if d != cur_dir:
-            out.append(f"📂 <b>{d}</b>")
-            cur_dir = d; cur_cat = cur_tt = None
-        if c != cur_cat:
-            out.append(f"  └ <b>{c}</b>")
-            cur_cat = c; cur_tt = None
-        if t != cur_tt:
-            out.append(f"    └ <i>{t or '—'}</i>")
-            cur_tt = t
+        if src != cur_src:
+            out.append(f"📂 <b>{src}</b>")
+            cur_src = src; cur_cat = cur_sub = None
+        if cat != cur_cat:
+            out.append(f"  └ <b>{cat or '—'}</b>")
+            cur_cat = cat; cur_sub = None
+        if sub != cur_sub:
+            out.append(f"    └ <i>{sub}</i>")
+            cur_sub = sub
         line = f"      {icon} {txt}"
         if dl: line += f"  <i>(до {dl})</i>"
         out.append(line)
     return "\n".join(out)
 
-def get_tasks_for_date(user_id, date_str):
-    rows = ws_tasks.get_all_records()
-    return [r for r in rows if str(r.get("User ID")) == str(user_id) and r.get("Дата") == date_str]
-
-def get_tasks_for_week(user_id, start_dt=None):
-    if not start_dt:
-        start_dt = now_local().date()
-    days = [(start_dt + timedelta(days=i)).strftime("%d.%m.%Y") for i in range(7)]
-    rows = ws_tasks.get_all_records()
-    return [r for r in rows if str(r.get("User ID")) == str(user_id) and r.get("Дата") in days]
-
-# ========= КЛАВИАТУРЫ =========
+# ========= КЛАВИАТУРЫ / СОСТОЯНИЯ =========
 def main_menu():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     kb.row("📅 Сегодня", "📆 Неделя", "🗓 Вся неделя")
     kb.row("➕ Добавить", "✅ Я сделал…", "🧠 Ассистент")
+    kb.row("⚙️ Настройки")
     return kb
 
-def week_days_menu():
+def week_menu():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
     base = now_local().date()
     for i in range(7):
         d = base + timedelta(days=i)
-        kb.add(f"{weekday_ru(datetime(d.year,d.month,d.day))} ({d.strftime('%d.%m.%Y')})")
+        kb.add(f"{weekday_full(datetime(d.year,d.month,d.day))} ({d.strftime('%d.%m.%Y')})")
     kb.add("⬅ Назад")
     return kb
 
-# ========= СОСТОЯНИЯ ПОЛЬЗОВАТЕЛЕЙ (простой FSM) =========
-USER_STATE = {}         # user_id -> state
-USER_BUFFER = {}        # user_id -> temp payload
+USER_STATE = {}
+USER_BUF   = {}
 
 def set_state(uid, state, data=None):
     USER_STATE[uid] = state
     if data is not None:
-        USER_BUFFER[uid] = data
+        USER_BUF[uid] = data
 
 def clear_state(uid):
     USER_STATE.pop(uid, None)
-    USER_BUFFER.pop(uid, None)
+    USER_BUF.pop(uid, None)
+
+# ========= GPT АССИСТЕНТ =========
+def ai_respond(prompt, context=""):
+    if not OPENAI_API_KEY:
+        return "Без GPT: начни с задач с ближайшим дедлайном и высокой важностью."
+    try:
+        from openai import OpenAI
+        client = OpenAI(api_key=OPENAI_API_KEY)
+        sys = ("Ты личный ассистент по задачам. Кратко, по делу, на русском. "
+               "Учитывай дедлайны и источники (Кофейня/Табачка/WB/Личное). "
+               "Форматируй ответ списком с эмодзи.")
+        msg = f"Запрос: {prompt}\n\nЗадачи:\n{context[:3500]}"
+        resp = client.chat.completions.create(
+            model="gpt-4o-mini",
+            messages=[{"role":"system","content":sys},{"role":"user","content":msg}],
+            temperature=0.3
+        )
+        return resp.choices[0].message.content.strip()
+    except Exception as e:
+        log.error(f"AI error: {e}")
+        return "Ассистент сейчас недоступен."
 
 # ========= ХЕНДЛЕРЫ =========
 @bot.message_handler(commands=["start"])
-def cmd_start(m):
-    bot.send_message(m.chat.id, "Привет! Я твой ассистент по задачам. Чем займёмся?", reply_markup=main_menu())
+def start(m):
+    bot.send_message(m.chat.id, "Привет! Я помогу управлять задачами. Выбери действие:", reply_markup=main_menu())
 
 @bot.message_handler(func=lambda msg: msg.text == "📅 Сегодня")
-def handle_today(m):
+def show_today(m):
     uid = m.chat.id
-    # на всякий: каждый раз перед выводом убеждаемся, что повторящиеся задачи расширены на сегодня
     expand_repeats_for_date(now_local())
-    date_s = today_str()
-    tasks = get_tasks_for_date(uid, date_s)
-    text = f"📅 Задачи на {date_s}\n\n" + format_tasks_grouped(tasks, header_date=date_s)
-    bot.send_message(uid, text, reply_markup=main_menu())
+    d = today_str()
+    tasks = tasks_for_date(uid, d)
+    bot.send_message(uid, f"📅 Задачи на {d}\n\n" + format_grouped(tasks, header_date=d), reply_markup=main_menu())
 
 @bot.message_handler(func=lambda msg: msg.text == "📆 Неделя")
-def handle_week_menu(m):
-    bot.send_message(m.chat.id, "Выбери день:", reply_markup=week_days_menu())
+def choose_day(m):
+    bot.send_message(m.chat.id, "Выбери день:", reply_markup=week_menu())
 
 @bot.message_handler(func=lambda msg: msg.text == "🗓 Вся неделя")
-def handle_all_week(m):
+def all_week(m):
     uid = m.chat.id
-    # расширим повторяющиеся задачи на неделю вперёд (при первом открытии)
     for i in range(7):
         expand_repeats_for_date(now_local() + timedelta(days=i))
-    tasks = get_tasks_for_week(uid)
-    # сгруппируем по дням, с заголовками и отступами
+    tasks = tasks_for_week(uid)
     if not tasks:
         bot.send_message(uid, "На неделю задач нет.", reply_markup=main_menu())
         return
-
     by_day = {}
     for r in tasks:
         by_day.setdefault(r["Дата"], []).append(r)
-
     parts = []
-    for d in sorted(by_day.keys(), key=lambda s: datetime.strptime(s, "%d.%m.%Y")):
-        parts.append(format_tasks_grouped(by_day[d], header_date=d))
+    for d in sorted(by_day.keys(), key=lambda s: datetime.strptime(s,"%d.%m.%Y")):
+        parts.append(format_grouped(by_day[d], header_date=d))
         parts.append("")  # пустая строка между днями
     bot.send_message(uid, "\n".join(parts), reply_markup=main_menu())
 
 @bot.message_handler(func=lambda msg: "(" in msg.text and ")" in msg.text)
-def handle_specific_day(m):
+def specific_day(m):
     uid = m.chat.id
     try:
         date_s = m.text.split("(")[1].strip(")")
-    except:
+        dt = datetime.strptime(date_s, "%d.%m.%Y")
+    except Exception:
         bot.send_message(uid, "Не понял дату, попробуй ещё раз.", reply_markup=main_menu())
         return
-    # расширим повторяющиеся на конкретный день на всякий
-    dt = datetime.strptime(date_s, "%d.%m.%Y")
     expand_repeats_for_date(LOCAL_TZ.localize(dt))
-    tasks = get_tasks_for_date(uid, date_s)
-    text = f"📅 Задачи на {date_s}\n\n" + format_tasks_grouped(tasks, header_date=date_s)
-    bot.send_message(uid, text, reply_markup=main_menu())
+    t = tasks_for_date(uid, date_s)
+    bot.send_message(uid, f"📅 Задачи на {date_s}\n\n" + format_grouped(t, header_date=date_s), reply_markup=main_menu())
+
+@bot.message_handler(func=lambda msg: msg.text == "➕ Добавить")
+def add_start(m):
+    set_state(m.chat.id, "adding_text")
+    bot.send_message(m.chat.id,
+        "Опиши задачу одним сообщением (можно с повторяемостью):\n"
+        "Примеры:\n"
+        "• Заказать К-Экспро Центр и Полет каждые 2 дня 14:00 (кофейня)\n"
+        "• Вылегжанина Центр — заказ завтра 14:00 (кофейня)\n"
+        "• Личное — записаться к стоматологу 20.08 10:00\n")
+
+@bot.message_handler(func=lambda msg: USER_STATE.get(msg.chat.id) == "adding_text")
+def add_parse(m):
+    uid = m.chat.id
+    text = m.text.strip()
+    try:
+        # Очень простая эвристика + поля в понятный вид.
+        # Поддержим источники:
+        src = ""
+        tl = text.lower()
+        if "кофейн" in tl: src = "кофейня"
+        elif "табач" in tl: src = "табачка"
+        elif "wb" in tl or "wild" in tl: src = "wb"
+        elif "личн" in tl: src = "личное"
+
+        # Подкатегории (точки)
+        sub = ""
+        pts = []
+        if "центр" in tl: pts.append("центр")
+        if "полет" in tl or "полёт" in tl: pts.append("полет")
+        if "климов" in tl: pts.append("климово")
+        if pts:
+            sub = ", ".join([p.capitalize() for p in pts])
+
+        # Время
+        mtime = re.search(r"(\d{1,2}:\d{2})", text)
+        tpart = mtime.group(1) if mtime else ""
+
+        # Дата (может отсутствовать — тогда шаблон)
+        mdate = re.search(r"(\d{2}\.\d{2}\.\d{4})", text)
+        dpart = mdate.group(1) if mdate else ""
+
+        # Повторяемость
+        repeat = ""
+        if "каждые 2 дня" in tl or "каждый второй день" in tl:
+            repeat = f"каждые 2 дня {tpart}".strip()
+        if "каждый" in tl or "по " in tl:
+            # включим как есть — пользователь пишет «каждый вторник 12:00» / «по пн,ср»
+            # мы не будем портить формулировку
+            repeat = (repeat or text).lower()
+            # но если в repeat нет времени — допишем найденное
+            if tpart and (not re.search(r"\d{1,2}:\d{2}", repeat)):
+                repeat += f" {tpart}"
+
+        # Категория — грубо
+        cat = "Общее"
+        if any(k in tl for k in ["заказ","закуп"]): cat = "Закупка"
+        if any(k in tl for k in ["приемк","приёмк"]): cat = "Поставка"
+
+        # Поставщик — просто подставим в текст, правила — через «Повторяемость»
+        supplier_tag = ""
+        if "к-экспро" in tl or "k-exp" in tl:
+            supplier_tag = "к-экспро"
+            if not repeat:
+                repeat = "к-экспро"
+        if "вылегжан" in tl:
+            supplier_tag = "ип вылегжанина"
+            if not repeat:
+                repeat = "ип вылегжанина"
+
+        # Текст задачи — как ввёл пользователь
+        task_text = text
+
+        if not dpart and not repeat:
+            # если ни даты, ни повтора — поставим на сегодня
+            dpart = today_str()
+
+        if pts:
+            # Сгенерируем строки «по точкам»
+            for pt in pts:
+                sub1 = pt.capitalize()
+                add_task(dpart or "", cat, sub1, task_text, tpart, uid, "", repeat, src)
+        else:
+            add_task(dpart or "", cat, sub, task_text, tpart, uid, "", repeat, src)
+
+        bot.send_message(uid, "✅ Добавлено.", reply_markup=main_menu())
+        log_event(uid, "add_task_free", text)
+    except Exception as e:
+        log.error(f"add_parse error: {e}")
+        bot.send_message(uid, "Не удалось добавить задачу.", reply_markup=main_menu())
+    finally:
+        clear_state(uid)
+
+@bot.message_handler(func=lambda msg: msg.text == "✅ Я сделал…")
+def done_start(m):
+    set_state(m.chat.id, "done_text")
+    bot.send_message(m.chat.id,
+        "Напиши что сделал. Примеры:\n"
+        "• я сделал заказы к-экспро центр\n"
+        "• я сделал все заказы к-экспро\n"
+        "• отметил сделать задачу «Позвонить ...» как выполненную")
+
+@bot.message_handler(func=lambda msg: USER_STATE.get(msg.chat.id) == "done_text")
+def done_parse(m):
+    uid = m.chat.id
+    txt = m.text.strip().lower()
+    try:
+        # 1) Быстрый путь — поставщики
+        sup = None
+        if "к-экспро" in txt or "k-exp" in txt: sup = "к-экспро"
+        if "вылегжан" in txt: sup = "ип вылегжанина"
+        pt = None
+        if "центр" in txt: pt = "центр"
+        if "полет" in txt or "полёт" in txt: pt = "полет"
+        if "климов" in txt: pt = "климово"
+        match_all = "все" in txt or "всё" in txt
+
+        changed = []
+        if sup:
+            changed = mark_done_by_supplier_today(uid, sup, point=pt, match_all=match_all)
+        else:
+            # 2) По фразе «отметь задачу … как выполненную»
+            # найдём первую задачку сегодня, в тексте которой есть ключевая часть
+            key = None
+            m1 = re.search(r"задач[ауе]\s+«(.+?)»", txt) or re.search(r"задач[ауе]\s+\"(.+?)\"", txt)
+            if m1:
+                key = m1.group(1).lower()
+            if key:
+                today = today_str()
+                for r in tasks_for_date(uid, today):
+                    t = (r.get("Задача") or "").lower()
+                    if key in t and (r.get("Статус") or "").lower() != "выполнено":
+                        row_idx = find_row_by_unique(today, r.get("Задача") or "", uid)
+                        if row_idx:
+                            ws_tasks.update_cell(row_idx, TASK_COLS.index("Статус")+1, "выполнено")
+                            changed = [r]
+                            break
+
+        # 3) Если это был поставщик — запланируем по правилам автоматически
+        if sup and changed:
+            # Для простоты — создадим «приемку завтра» и «следующий заказ» по их ритмам
+            base = now_local().date()
+            if sup == "к-экспро":
+                delivery = base + timedelta(days=1)
+                next_order = base + timedelta(days=2)
+            else:  # вылегжанина
+                delivery = base + timedelta(days=1)
+                next_order = delivery + timedelta(days=2)
+
+            # возьмём точки из изменённых задач
+            tps = list({ (r.get("Подкатегория") or "").strip() for r in changed if r.get("Подкатегория") })
+            for tp in tps:
+                add_task(delivery.strftime("%d.%m.%Y"), "Поставка", tp, f"Приемка {sup} ({tp})", "10:00", uid, "", "авто", "кофейня")
+                add_task(next_order.strftime("%d.%m.%Y"), "Закупка", tp, f"Заказ {sup} ({tp})", "14:00", uid, "", "авто", "кофейня")
+
+        if changed:
+            bot.send_message(uid, f"✅ Отметил выполненным: {len(changed)}.", reply_markup=main_menu())
+        else:
+            bot.send_message(uid, "Не нашёл подходящих задач. Уточни формулировку.", reply_markup=main_menu())
+
+        log_event(uid, "done_free", txt)
+    except Exception as e:
+        log.error(f"done_parse error: {e}")
+        bot.send_message(uid, "Ошибка при обработке.", reply_markup=main_menu())
+    finally:
+        clear_state(uid)
+
+@bot.message_handler(func=lambda msg: msg.text == "🧠 Ассистент")
+def assistant_start(m):
+    set_state(m.chat.id, "assistant_text")
+    bot.send_message(m.chat.id, "Сформулируй запрос (приоритизация, расписание и т.п.).")
+
+@bot.message_handler(func=lambda msg: USER_STATE.get(msg.chat.id) == "assistant_text")
+def assistant_reply(m):
+    uid = m.chat.id
+    q = m.text.strip()
+    try:
+        # контекст — неделя задач
+        t = tasks_for_week(uid)
+        lines = []
+        for r in sorted(t, key=lambda x: (datetime.strptime(x["Дата"], "%d.%m.%Y"), x.get("Дедлайн","") or "", x.get("Задача","") or "")):
+            lines.append(f"{r['Дата']} • {r.get('Источник','')} / {r.get('Категория','')} / {r.get('Подкатегория','') or '—'} — {r.get('Задача','')} (до {r.get('Дедлайн','') or '—'}) [{r.get('Статус','')}]")
+        ctx = "\n".join(lines)
+        answer = ai_respond(q, ctx)
+        bot.send_message(uid, f"🧠 {answer}", reply_markup=main_menu())
+        log_event(uid, "assistant", q)
+    except Exception as e:
+        log.error(f"assistant error: {e}")
+        bot.send_message(uid, "Ассистент сейчас недоступен.", reply_markup=main_menu())
+    finally:
+        clear_state(uid)
+
+@bot.message_handler(func=lambda msg: msg.text == "⚙️ Настройки")
+def settings_menu(m):
+    uid = m.chat.id
+    s = get_user_settings(uid)
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row("⏰ Время дайджеста", "📨 Утренний дайджест: " + ("Вкл" if s["digest_on"] else "Выкл"))
+    kb.row("🔔 Напоминания: " + ("Вкл" if s["reminders_on"] else "Выкл"), "⏳ За сколько мин")
+    kb.row("⬅ Назад")
+    bot.send_message(uid,
+        f"Текущие настройки:\n"
+        f"• Дайджест: {'Вкл' if s['digest_on'] else 'Выкл'} в {s['digest_time']}\n"
+        f"• Напоминания: {'Вкл' if s['reminders_on'] else 'Выкл'} за {s['remind_before_min']} мин",
+        reply_markup=kb)
+
+@bot.message_handler(func=lambda msg: msg.text == "⏰ Время дайджеста")
+def set_digest_time(m):
+    set_state(m.chat.id, "set_digest_time")
+    bot.send_message(m.chat.id, "Напиши время в формате ЧЧ:ММ (например 08:00).")
+
+@bot.message_handler(func=lambda msg: USER_STATE.get(msg.chat.id) == "set_digest_time")
+def save_digest_time(m):
+    uid = m.chat.id
+    t = m.text.strip()
+    if not re.match(r"^\d{2}:\d{2}$", t):
+        bot.send_message(uid, "Формат времени ЧЧ:ММ. Попробуй ещё раз.", reply_markup=main_menu())
+    else:
+        set_user_setting(uid, "Время дайджеста", t)
+        bot.send_message(uid, f"Готово. Дайджест в {t}.", reply_markup=main_menu())
+    clear_state(uid)
+
+@bot.message_handler(func=lambda msg: msg.text.startswith("📨 Утренний дайджест:"))
+def toggle_digest(m):
+    uid = m.chat.id
+    s = get_user_settings(uid)
+    new = "нет" if s["digest_on"] else "да"
+    set_user_setting(uid, "Утренний дайджест", new)
+    bot.send_message(uid, f"Дайджест теперь: {'Вкл' if new=='да' else 'Выкл'}.", reply_markup=main_menu())
+
+@bot.message_handler(func=lambda msg: msg.text.startswith("🔔 Напоминания:"))
+def toggle_reminders(m):
+    uid = m.chat.id
+    s = get_user_settings(uid)
+    new = "нет" if s["reminders_on"] else "да"
+    set_user_setting(uid, "Напоминания", new)
+    bot.send_message(uid, f"Напоминания теперь: {'Вкл' if new=='да' else 'Выкл'}.", reply_markup=main_menu())
+
+@bot.message_handler(func=lambda msg: msg.text == "⏳ За сколько мин")
+def set_remind_before(m):
+    set_state(m.chat.id, "set_before")
+    bot.send_message(m.chat.id, "Сколько минут до дедлайна присылать напоминание? Введите число, например 30.")
+
+@bot.message_handler(func=lambda msg: USER_STATE.get(msg.chat.id) == "set_before")
+def save_remind_before(m):
+    uid = m.chat.id
+    try:
+        val = int(m.text.strip())
+        set_user_setting(uid, "За сколько мин напоминать", val)
+        bot.send_message(uid, f"Ок, напоминать за {val} мин до дедлайна.", reply_markup=main_menu())
+    except:
+        bot.send_message(uid, "Нужно число, например 30.", reply_markup=main_menu())
+    finally:
+        clear_state(uid)
 
 @bot.message_handler(func=lambda msg: msg.text == "⬅ Назад")
-def handle_back(m):
+def back_main(m):
     clear_state(m.chat.id)
     bot.send_message(m.chat.id, "Главное меню:", reply_markup=main_menu())
 
-# --- Добавление задач (умный ввод) ---
-@bot.message_handler(func=lambda msg: msg.text == "➕ Добавить")
-def handle_add(m):
-    set_state(m.chat.id, "adding_wait_text", {})
-    bot.send_message(m.chat.id, "Опиши задачу одним сообщением.\nНапример:\n<b>Заказать К-Экспро Центр и Полет каждые 2 дня в 14:00</b>")
-
-@bot.message_handler(func=lambda msg: msg.text == "✅ Я сделал…")
-def handle_done_free(m):
-    set_state(m.chat.id, "done_wait_text", {})
-    bot.send_message(m.chat.id, "Напиши что сделал. Примеры:\n<b>я сделал заказы к-экспро центр</b>\n<b>я сделал все заказы к-экспро</b>")
-
-@bot.message_handler(func=lambda msg: msg.text == "🧠 Ассистент")
-def handle_ai_assistant(m):
-    set_state(m.chat.id, "assistant_wait_text", {})
-    bot.send_message(m.chat.id, "Сформулируй, что нужно: составить расписание, приоритизировать задачи, напомнить о дедлайнах и т.п.")
-
-@bot.message_handler(func=lambda msg: USER_STATE.get(msg.chat.id) == "adding_wait_text")
-def adding_free_text(m):
-    uid = m.chat.id
-    txt = m.text.strip()
+# ========= РАССЫЛКИ / НАПОМИНАНИЯ =========
+def job_morning_digest():
+    """Ежедневно расширяем повторы на сегодня и шлём дайджест тем, у кого включено."""
     try:
-        items = ai_parse_free_text(txt, uid)
-        if not items:
-            bot.send_message(uid, "Не получилось распознать. Попробуй иначе.", reply_markup=main_menu())
-            clear_state(uid); return
-
-        created = []
-        repeats_added = 0
-        for it in items:
-            direction = it.get("direction") or "Личное"
-            category  = it.get("category") or "Общее"
-            text_val  = it.get("text") or "Задача"
-            tt       = it.get("tt") or ""
-            time_s   = it.get("time") or ""
-            supplier = it.get("supplier") or ""
-            kind     = it.get("kind") or "single"
-            user_id  = it.get("user_id") or uid
-
-            # если tt — список, добавим на каждую ТТ
-            tt_list = [t.strip() for t in (tt.split(",") if isinstance(tt,str) else [tt]) if t.strip()] or [""]
-
-            if kind == "repeat":
-                rule = it.get("repeat_rule") or ""
-                for t in tt_list:
-                    ws_repeating.append_row([
-                        rule, direction, category, t, text_val, time_s, supplier, str(user_id), "1"
-                    ], value_input_option="USER_ENTERED")
-                    repeats_added += 1
-            else:
-                d_str = it.get("date") or today_str()
-                for t in tt_list:
-                    add_task_row(d_str, direction, category, t, text_val, time_s, "", "разовая", "", user_id, supplier)
-                    created.append((d_str, direction, category, t, text_val, time_s))
-
-        msg_parts = []
-        if created:
-            msg_parts.append("✅ Добавил задачи:\n" + "\n".join([f"• {c[0]} [{c[1]}→{c[2]}→{c[3]}] {c[4]} (до {c[5] or '—'})" for c in created]))
-        if repeats_added:
-            msg_parts.append(f"🔁 Добавил повторяющихся правил: {repeats_added}")
-        bot.send_message(uid, "\n\n".join(msg_parts) or "Готово", reply_markup=main_menu())
-        log_event(uid, "add_free_text", txt)
-    except Exception as e:
-        log.error(f"Add parse error: {e}")
-        bot.send_message(uid, "Произошла ошибка при разборе. Попробуй заново.", reply_markup=main_menu())
-    finally:
-        clear_state(uid)
-
-@bot.message_handler(func=lambda msg: USER_STATE.get(msg.chat.id) == "done_wait_text")
-def done_free_text(m):
-    uid = m.chat.id
-    txt = m.text.strip().lower()
-
-    # очень простой парсинг
-    sup = None
-    if "к-экспро" in txt or "k-exp" in txt:
-        sup = "К-Экспро"
-    elif "вылегжан" in txt:
-        sup = "ИП Вылегжанина"
-
-    tt = None
-    if "центр" in txt: tt = "центр"
-    if "полет" in txt or "полёт" in txt: tt = "полет"
-    if "климов" in txt: tt = "климово"
-
-    match_all = "все" in txt or "всё" in txt
-
-    try:
-        changed = mark_done_by_text(uid, supplier=sup, tt=tt, match_all=match_all)
-        if not changed:
-            bot.send_message(uid, "Не нашёл подходящих задач на сегодня. Уточни формулировку.", reply_markup=main_menu())
-            clear_state(uid); return
-
-        # Если это поставщик с правилами — создадим приемку/следующий заказ
-        if sup:
-            direction = direction_for_supplier(sup) or "Кофейня"
-            # определим ТТ-лист из измененных задач
-            tt_list = list({ r.get("ТТ") for r in changed if r.get("ТТ") })
-            created = plan_next_by_supplier_rule(uid, sup, direction, tt_list)
-            extra = ""
-            if created:
-                extra = "\n\n🔮 Запланировал по правилам:\n" + "\n".join([f"• {tt}: приемка {d1.strftime('%d.%m')} → новый заказ {d2.strftime('%d.%m')}" for tt,d1,d2 in created])
-            bot.send_message(uid, f"✅ Отметил выполненным: {len(changed)}.\n{extra}".strip(), reply_markup=main_menu())
-        else:
-            bot.send_message(uid, f"✅ Отметил выполненным: {len(changed)}.", reply_markup=main_menu())
-
-        log_event(uid, "done_free_text", txt)
-    except Exception as e:
-        log.error(f"Done free error: {e}")
-        bot.send_message(uid, "Ошибка при отметке. Попробуй ещё раз.", reply_markup=main_menu())
-    finally:
-        clear_state(uid)
-
-@bot.message_handler(func=lambda msg: USER_STATE.get(msg.chat.id) == "assistant_wait_text")
-def ai_answer(m):
-    uid = m.chat.id
-    query = m.text.strip()
-    try:
-        # соберём контекст задач на 7 дней для ассистента
-        tasks = get_tasks_for_week(uid)
-        brief = []
-        for r in sorted(tasks, key=lambda x: (datetime.strptime(x["Дата"], "%d.%m.%Y"), x.get("Дедлайн",""), x.get("Задача",""))):
-            brief.append(f"{r['Дата']} • {r['Направление']} / {r['Категория']} / {r['ТТ'] or '—'} — {r['Задача']} (до {r['Дедлайн'] or '—'}) [{r.get('Статус','')}]")
-        context = "\n".join(brief)[:4000]
-
-        if not OPENAI_API_KEY:
-            # Фоллбек: простая эвристика
-            bot.send_message(uid, "🧠 (Без GPT) Совет: начни с задач с ближайшим дедлайном и высокой важностью.", reply_markup=main_menu())
-            clear_state(uid); return
-
-        from openai import OpenAI
-        client = OpenAI(api_key=OPENAI_API_KEY)
-        sys = (
-            "Ты личный ассистент по задачам. На основе списка задач пользователя помоги спланировать, приоритизировать, "
-            "напомнить о важных дедлайнах. Пиши кратко и по делу, на русском, с буллетами."
-        )
-        prompt = f"Запрос: {query}\n\nМои задачи на неделю:\n{context}"
-        resp = client.chat.completions.create(
-            model="gpt-4o-mini",
-            messages=[{"role":"system","content":sys},{"role":"user","content":prompt}],
-            temperature=0.3
-        )
-        answer = resp.choices[0].message.content.strip()
-        bot.send_message(uid, f"🧠 {answer}", reply_markup=main_menu())
-        log_event(uid, "assistant_query", query)
-    except Exception as e:
-        log.error(f"AI error: {e}", exc_info=True)
-        bot.send_message(uid, "Не удалось получить ответ ассистента.", reply_markup=main_menu())
-    finally:
-        clear_state(uid)
-
-# ========= ПЛАНИРОВЩИК (ЕЖЕДНЕВНАЯ РАССЫЛКА) =========
-def job_daily_digest():
-    try:
-        # На всякий — расширим повторяющиеся на сегодня
         expand_repeats_for_date(now_local())
-        users = read_all(ws_users)
-        today = today_str()
+        users = get_all(ws_users)
+        d = today_str()
         for u in users:
             uid = str(u.get("Telegram ID") or "").strip()
-            if not uid:
+            if not uid: continue
+            s = get_user_settings(uid)
+            if not s["digest_on"]:
                 continue
-            tasks = get_tasks_for_date(uid, today)
-            if not tasks:
-                continue
-            text = f"📅 План на {today}\n\n" + format_tasks_grouped(tasks, header_date=today)
-            try:
-                bot.send_message(uid, text)
-            except Exception as e:
-                log.error(f"Не смог отправить дайджест {uid}: {e}")
+            # время проверяем в отдельном джобе (см. job_tick), здесь просто на случай ручного вызова
+            t = tasks_for_date(uid, d)
+            if t:
+                bot.send_message(uid, f"📅 План на {d}\n\n" + format_grouped(t, header_date=d))
     except Exception as e:
-        log.error(f"job_daily_digest error: {e}")
+        log.error(f"job_morning_digest error: {e}")
 
-def scheduler_thread():
-    # 09:00 по локальному TZ
+def send_reminders_tick():
+    """Каждую минуту проверяем: у кого включены напоминания — слать перед дедлайном."""
+    try:
+        now = now_local()
+        today = today_str()
+        users = get_all(ws_users)
+        for u in users:
+            uid = str(u.get("Telegram ID") or "").strip()
+            if not uid: continue
+            s = get_user_settings(uid)
+            if not s["reminders_on"]:
+                continue
+            before = s["remind_before_min"]
+            tlist = tasks_for_date(uid, today)
+            for r in tlist:
+                if (r.get("Статус") or "").lower() == "выполнено":
+                    continue
+                dl = (r.get("Дедлайн") or "").strip()
+                if not re.match(r"^\d{1,2}:\d{2}$", dl):
+                    continue
+                try:
+                    hh, mm = map(int, dl.split(":"))
+                    dl_dt = now.replace(hour=hh, minute=mm, second=0, microsecond=0)
+                    remind_at = dl_dt - timedelta(minutes=int(before))
+                    # триггер по минуте
+                    if remind_at.strftime("%Y-%m-%d %H:%M") == now.strftime("%Y-%m-%d %H:%M"):
+                        txt = r.get("Задача") or ""
+                        src = (r.get("Источник") or "").capitalize()
+                        sub = (r.get("Подкатегория") or "") or "—"
+                        bot.send_message(uid, f"🔔 Напоминание: {txt}\nИсточник: {src} / {sub}\nДедлайн: {dl}")
+                except Exception:
+                    continue
+    except Exception as e:
+        log.error(f"send_reminders_tick error: {e}")
+
+def job_tick():
+    """Минутный тикер: персональные времена дайджеста + напоминания."""
+    try:
+        now = now_local()
+        users = get_all(ws_users)
+        for u in users:
+            uid = str(u.get("Telegram ID") or "").strip()
+            if not uid: continue
+            s = get_user_settings(uid)
+            # Персональный дайджест
+            if s["digest_on"]:
+                t = s["digest_time"] or "08:00"
+                if re.match(r"^\d{2}:\d{2}$", t):
+                    if now.strftime("%H:%M") == t:
+                        # Чтобы не шлёпать несколько раз в ту же минуту — доверимся минутному тикеру (один раз)
+                        d = today_str()
+                        expand_repeats_for_date(now)
+                        ts = tasks_for_date(uid, d)
+                        if ts:
+                            bot.send_message(uid, f"📅 План на {d}\n\n" + format_grouped(ts, header_date=d))
+        # Напоминания
+        send_reminders_tick()
+    except Exception as e:
+        log.error(f"job_tick error: {e}")
+
+def scheduler_loop():
     schedule.clear()
-    schedule.every().day.at("09:00").do(job_daily_digest)
+    # Минутный тикер
+    schedule.every().minute.do(job_tick)
+    # На всякий случай — «бекап» общего утреннего дайджеста на 08:00 МСК
+    schedule.every().day.at("08:00").do(job_morning_digest)
     while True:
         schedule.run_pending()
         time.sleep(1)
@@ -755,8 +796,6 @@ def home():
 if __name__ == "__main__":
     if not API_TOKEN or not WEBHOOK_URL:
         raise RuntimeError("Не заданы TELEGRAM_TOKEN или WEBHOOK_BASE")
-
-    # только webhook, НИКАКОГО polling — иначе 409
     try:
         bot.remove_webhook()
     except Exception:
@@ -764,8 +803,5 @@ if __name__ == "__main__":
     time.sleep(0.5)
     bot.set_webhook(url=WEBHOOK_URL)
 
-    # Запускаем планировщик в фоне
-    threading.Thread(target=scheduler_thread, daemon=True).start()
-
-    # Flask-сервер для Telegram Webhook и здоровья
+    threading.Thread(target=scheduler_loop, daemon=True).start()
     app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
