@@ -1,581 +1,514 @@
+# tasks_bot.py
 import os
 import re
 import json
-import time
 import logging
-import threading
+from datetime import datetime, timedelta, time as dtime
 from collections import defaultdict
-from datetime import datetime, timedelta
-from zoneinfo import ZoneInfo
 
+import pytz
+from flask import Flask, request
 import telebot
 from telebot import types
-from flask import Flask, request
-
 import gspread
-import schedule
 
-# =========================
-#        НАСТРОЙКИ
-# =========================
+from apscheduler.schedulers.background import BackgroundScheduler
+from apscheduler.triggers.cron import CronTrigger
 
-# === Переменные окружения (рекомендуется на Render) ===
-API_TOKEN = os.getenv("BOT_TOKEN", "7959600917:AAF7szpbvX8CoFObxjVb6y3aCiSceCi-Rt4")
-TABLE_URL = os.getenv("TABLE_URL", "https://docs.google.com/spreadsheets/d/1lIV2kUx8sDHR1ynMB2di8j5n9rpj1ydhsmfjXJpRGeA/edit?usp=sharing")
+# ---------------------------
+# Конфиг / окружение
+# ---------------------------
+API_TOKEN = os.getenv("API_TOKEN", "").strip()
+TABLE_URL = os.getenv("TABLE_URL", "").strip()
 CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS", "/etc/secrets/credentials.json")
-WEBHOOK_BASE = os.getenv("WEBHOOK_BASE", "https://tasksbot-hy3t.onrender.com")
-WEBHOOK_URL = f"{WEBHOOK_BASE}/{API_TOKEN}"
+WEBHOOK_BASE = os.getenv("WEBHOOK_BASE", "").rstrip("/")
+OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "").strip()
+TZ_NAME = os.getenv("TZ", "UTC")
 
-# Часовой пояс для расписаний (без pytz)
-TIMEZONE = os.getenv("TIMEZONE", "Europe/Moscow")
+if not API_TOKEN or ":" not in API_TOKEN:
+    raise RuntimeError("API_TOKEN пустой или некорректный")
 
-# Админы (через запятую список числовых Telegram ID)
-ADMIN_IDS = {id_.strip() for id_ in os.getenv("ADMIN_IDS", "").split(",") if id_.strip()}
+if not TABLE_URL:
+    raise RuntimeError("TABLE_URL не задан")
 
-# Опционально: интеграция с OpenAI (ChatGPT)
-OPENAI_API_KEY = os.getenv("OPENAI_API_KEY", "")
-OPENAI_MODEL = os.getenv("OPENAI_MODEL", "gpt-4o-mini")
+if not os.path.exists(CREDENTIALS_FILE):
+    raise RuntimeError(f"Не найден файл cred: {CREDENTIALS_FILE}")
 
-# =========================
-#         ЛОГИ
-# =========================
-
+# Логирование
 logging.basicConfig(
     level=logging.INFO,
-    format="%(asctime)s [%(levelname)s] %(message)s"
+    format="%(asctime)s [%(levelname)s] %(name)s — %(message)s"
 )
-logger = logging.getLogger("tasksbot")
+log = logging.getLogger("tasks-bot")
 
-# =========================
-#     TELEGRAM & FLASK
-# =========================
+# Часовой пояс
+tz = pytz.timezone(TZ_NAME)
 
+# ---------------------------
+# Telegram bot (только webhook)
+# ---------------------------
 bot = telebot.TeleBot(API_TOKEN, parse_mode="HTML")
-app = Flask(__name__)
 
-# =========================
-#   GOOGLE SHEETS CLIENT
-# =========================
-
+# ---------------------------
+# Google Sheets
+# ---------------------------
 gc = gspread.service_account(filename=CREDENTIALS_FILE)
 sh = gc.open_by_url(TABLE_URL)
-
-def _safe_worksheet(sheet, title):
-    try:
-        return sheet.worksheet(title)
-    except Exception as e:
-        logger.warning("Лист '%s' не найден: %s", title, e)
-        return None
-
-tasks_ws = _safe_worksheet(sh, "Задачи")
-users_ws = _safe_worksheet(sh, "Пользователи")
-repeat_ws = _safe_worksheet(sh, "Повторяющиеся задачи")  # опционально
+tasks_ws = sh.worksheet("Задачи")
+users_ws = sh.worksheet("Пользователи")
 
 # Ожидаемая структура листа "Задачи":
-# A: Дата (ДД.ММ.ГГГГ)
-# B: Категория
-# C: Подкатегория
-# D: Задача
-# E: Дедлайн (ЧЧ:ММ)
-# F: Статус (выполнено / "")
-# G: Повтор (например "повтор")
-# H: User ID (число)
+# Дата | Категория | Подкатегория | Задача | Дедлайн | Статус | Повторяемость | User ID
+# where: Статус: "выполнено" / "" ; Повторяемость: строка или шаблон; User ID: chat.id
 
-# =========================
-#         КЕШ
-# =========================
-
-_cache = {
-    "tasks": {"ts": 0, "data": []},
-    "users": {"ts": 0, "data": []},
-    "repeat": {"ts": 0, "data": []},
-}
-CACHE_TTL = 20  # секунд
-
-def _cache_get(name):
-    now = time.time()
-    if now - _cache[name]["ts"] <= CACHE_TTL:
-        return _cache[name]["data"]
-    return None
-
-def _cache_set(name, data):
-    _cache[name]["ts"] = time.time()
-    _cache[name]["data"] = data
-
-def _invalidate_cache(*names):
-    for n in names:
-        if n in _cache:
-            _cache[n]["ts"] = 0
-
-# =========================
-#   УТИЛИТЫ ДАТ/ВРЕМЕНИ
-# =========================
-
-RU_WEEKDAYS = ["Понедельник","Вторник","Среда","Четверг","Пятница","Суббота","Воскресенье"]
-RU_WEEKDAYS_L = ["понедельник","вторник","среда","четверг","пятница","суббота","воскресенье"]
-
-def now_tz():
-    return datetime.now(ZoneInfo(TIMEZONE))
-
-def fmt_date(d: datetime) -> str:
-    return d.strftime("%d.%m.%Y")
-
-def parse_date(s: str) -> datetime | None:
+# ---------------------------
+# OpenAI (GPT ассистент)
+# ---------------------------
+from openai import OpenAI
+oai_client = None
+if OPENAI_API_KEY:
     try:
-        return datetime.strptime(s, "%d.%m.%Y")
-    except Exception:
-        return None
+        oai_client = OpenAI(api_key=OPENAI_API_KEY)
+    except Exception as e:
+        log.error(f"OpenAI init error: {e}")
 
-def day_name(date: datetime) -> str:
-    return RU_WEEKDAYS[date.weekday()]
+SYSTEM_PROMPT = """Ты — личный ассистент по задачам.
+У тебя есть список задач пользователя (сегодня, неделя, категории).
+Твоя цель — понять намерение и вернуть СТРОГО JSON с полями:
+{
+  "action": "...",        // one of: "list_today", "list_week", "list_day", "mark_done", "add_task", "reschedule", "help"
+  "date": "ДД.ММ.ГГГГ",   // если нужно
+  "task_query": "...",    // текст для поиска задачи (фрагмент)
+  "category": "...",
+  "subcategory": "...",
+  "deadline": "ЧЧ:ММ",
+  "repeat": "...",        // маркер повторяемости
+  "free_text": "..."      // орг. описание
+}
+Если команда неясна, верни action="help".
+Отвечай ТОЛЬКО JSON без комментариев.
+Примеры:
+"я выполнил заказ табака" => {"action":"mark_done","task_query":"заказ табака"}
+"добавь завтра купить молоко в 10:00" => {"action":"add_task","date":"<завтрашняя дата>","task_query":"купить молоко","deadline":"10:00"}
+"перенеси заказ кофе на пятницу 15:00" => {"action":"reschedule","date":"<ближайшая пятница>","task_query":"заказ кофе","deadline":"15:00"}
+"""
 
-def next_7_dates(start: datetime) -> list[datetime]:
-    return [start + timedelta(days=i) for i in range(7)]
+def weekday_name_ru(dt: datetime) -> str:
+    names = ["Понедельник","Вторник","Среда","Четверг","Пятница","Суббота","Воскресенье"]
+    return names[dt.weekday()]
 
-# =========================
-#     ДОСТУП К ДАННЫМ
-# =========================
+def week_dates(start: datetime) -> list:
+    return [(start + timedelta(days=i)).strftime("%d.%m.%Y") for i in range(7)]
 
-def get_users():
-    if not users_ws:
-        return []
-    cached = _cache_get("users")
-    if cached is not None:
-        return cached
-    rows = users_ws.get_all_records()
-    users = []
-    for r in rows:
-        if r.get("Telegram ID"):
+def normalize_date_str(s: str) -> str:
+    # ожидаем ДД.ММ.ГГГГ
+    if re.match(r"^\d{2}\.\d{2}\.\d{4}$", s):
+        return s
+    return ""
+
+def get_users() -> list:
+    items = []
+    for row in users_ws.get_all_records():
+        tid = str(row.get("Telegram ID") or "").strip()
+        if tid:
             cats = []
-            raw = r.get("Категории задач") or ""
+            raw = (row.get("Категории задач") or "").strip()
             if raw:
                 cats = [c.strip() for c in raw.split(",") if c.strip()]
-            users.append({
-                "name": r.get("Имя", ""),
-                "id": str(r.get("Telegram ID")),
-                "categories": cats
-            })
-    _cache_set("users", users)
-    return users
+            items.append({"id": tid, "name": row.get("Имя",""), "categories": cats})
+    return items
 
-def get_all_tasks():
-    if not tasks_ws:
-        return []
-    cached = _cache_get("tasks")
-    if cached is not None:
-        return cached
-    data = tasks_ws.get_all_records()
-    _cache_set("tasks", data)
-    return data
+def get_tasks_raw():
+    return tasks_ws.get_all_records()
 
-def get_repeat_tasks():
-    if not repeat_ws:
-        return []
-    cached = _cache_get("repeat")
-    if cached is not None:
-        return cached
-    data = repeat_ws.get_all_records()
-    _cache_set("repeat", data)
-    return data
+def filter_tasks_by_user(tasks, user_id):
+    return [t for t in tasks if str(t.get("User ID")) == str(user_id)]
 
-def add_task(date, category, subcategory, task, deadline, user_id, status="", repeat=""):
-    # При добавлении — сразу инвалидируем кеш
-    if not tasks_ws:
-        return
-    tasks_ws.append_row([date, category, subcategory, task, deadline, status, repeat, str(user_id)])
-    _invalidate_cache("tasks")
+def tasks_for_date(user_id, date_str):
+    rows = filter_tasks_by_user(get_tasks_raw(), user_id)
+    return [r for r in rows if (r.get("Дата") == date_str)]
 
-def mark_task_done_by_desc_for_user(user_id, date_str, index_in_list):
-    # Находим задачу из "видимого" списка пользователя за день и помечаем как выполненную
-    tasks = get_tasks_for_date(user_id, date_str)
-    if not (0 <= index_in_list < len(tasks)):
-        return False, "Неверный номер."
-    desc = tasks[index_in_list].get("Задача", "")
-    # Ищем первую подходящую ячейку с этим описанием + датой + user_id
-    all_rows = tasks_ws.get_all_values()
-    # Заголовки ожидаются в первой строке
-    # Ищем по всем строкам
-    for r_idx, row in enumerate(all_rows, start=1):
-        if r_idx == 1:
-            continue
+def tasks_for_week(user_id, start: datetime):
+    dates = set(week_dates(start))
+    rows = filter_tasks_by_user(get_tasks_raw(), user_id)
+    return [r for r in rows if r.get("Дата") in dates]
+
+def append_task(date_s, category, subcategory, task, deadline, user_id, status="", repeat=""):
+    tasks_ws.append_row([date_s, category, subcategory, task, deadline, status, repeat, str(user_id)])
+
+def find_first_cell_in_col(ws, col_idx, value):
+    # аккуратный поиск в колонке: вернем первую ячейку с точным совпадением
+    try:
+        cells = ws.findall(value)
+        for c in cells:
+            if c.col == col_idx:
+                return c
+    except Exception:
+        pass
+    return None
+
+def fuzzy_pick_task(rows, query):
+    # простая "размытая" выборка по подстроке
+    q = (query or "").strip().lower()
+    if not q:
+        return None
+    scored = []
+    for r in rows:
+        desc = str(r.get("Задача",""))
+        if q in desc.lower():
+            # чем короче разница, тем лучше
+            scored.append((len(desc) - len(q), r))
+    scored.sort(key=lambda x: x[0])
+    return scored[0][1] if scored else None
+
+def format_tasks_grouped(rows, title_date: str = "") -> str:
+    # Группировка по Категория/Подкатегория + красивые значки
+    if not rows:
+        return "Задач нет. Отдохни 😊"
+    groups = defaultdict(lambda: defaultdict(list))
+    for r in rows:
+        cat = r.get("Категория","Без категории") or "Без категории"
+        sub = r.get("Подкатегория","—") or "—"
+        groups[cat][sub].append(r)
+
+    lines = []
+    if title_date:
+        # пример: • Среда — 13.08.2025
         try:
-            date_v = row[0].strip()
-            desc_v = row[3].strip()
-            user_v = row[7].strip() if len(row) >= 8 else ""
+            dt = datetime.strptime(title_date, "%d.%m.%Y")
+            lines.append(f"• <b>{weekday_name_ru(dt)}</b> — <b>{title_date}</b>\n")
         except Exception:
-            continue
-        if date_v == date_str and desc_v == desc and user_v == str(user_id):
-            # Статус — колонка F (6)
-            tasks_ws.update_cell(r_idx, 6, "выполнено")
-            _invalidate_cache("tasks")
-            return True, desc
-    return False, "Не нашёл задачу в таблице."
+            lines.append(f"• <b>{title_date}</b>\n")
 
-def get_tasks_for_date(user_id, date_str):
-    result = []
-    for r in get_all_tasks():
-        if r.get("Дата") == date_str and str(r.get("User ID")) == str(user_id):
-            result.append(r)
-    return result
-
-def get_tasks_for_week(user_id, start=None):
-    if start is None:
-        start = now_tz().replace(hour=0, minute=0, second=0, microsecond=0)
-    targets = {fmt_date(d) for d in next_7_dates(start)}
-    out = []
-    for r in get_all_tasks():
-        if r.get("Дата") in targets and str(r.get("User ID")) == str(user_id):
-            out.append(r)
-    return out
-
-# =========================
-#   ПОВТОРЯЮЩИЕСЯ ЗАДАЧИ
-# =========================
-
-def process_repeating_for_date(date_dt: datetime):
-    """Добавляет в 'Задачи' повторяющиеся задачи (если ещё нет) для указанной даты."""
-    if not repeat_ws:
-        return
-    date_str = fmt_date(date_dt)
-    weekday_rus = RU_WEEKDAYS_L[date_dt.weekday()]  # 'понедельник', ...
-    today_existing = {(t.get("Задача",""), str(t.get("User ID",""))) for t in get_all_tasks() if t.get("Дата")==date_str}
-
-    for row in get_repeat_tasks():
-        # Ожидаемые поля: День недели, Категория, Подкатегория, Задача, Время, User ID (опционально — кому назначать)
-        if (row.get("День недели") or "").strip().lower() != weekday_rus:
-            continue
-        task_desc = row.get("Задача", "").strip()
-        if not task_desc:
-            continue
-        target_user = str(row.get("User ID") or "").strip()
-        if not target_user:
-            # если не указан — не создаём, чтобы не раскидывать всем
-            continue
-        # Защита от дублей
-        if (task_desc, target_user) in today_existing:
-            continue
-        add_task(
-            date_str,
-            row.get("Категория", ""),
-            row.get("Подкатегория", ""),
-            task_desc,
-            row.get("Время", ""),
-            target_user,
-            status="",
-            repeat="повтор"
-        )
-
-def schedule_repeating_today_and_next():
-    # На всякий случай прогоняем для сегодня
-    today = now_tz().replace(hour=0, minute=0, second=0, microsecond=0)
-    process_repeating_for_date(today)
-
-# =========================
-#     ФОРМАТИРОВАНИЕ
-# =========================
-
-def pretty_day_block(user_id, date_dt):
-    date_str = fmt_date(date_dt)
-    tasks = get_tasks_for_date(user_id, date_str)
-    if not tasks:
-        return f"• <b>{day_name(date_dt)}</b> — {date_str}\n  <i>Нет задач</i>"
-
-    # Группируем по категориям → подкатегориям
-    grouped = defaultdict(lambda: defaultdict(list))
-    for t in tasks:
-        grouped[t.get("Категория","Без категории")][t.get("Подкатегория","Без подкатегории")].append(t)
-
-    lines = [f"• <b>{day_name(date_dt)}</b> — {date_str}"]
-    for cat in sorted(grouped.keys()):
-        lines.append(f"\n<b>📂 {cat}</b>")
-        for sub in sorted(grouped[cat].keys()):
-            lines.append(f"  └ <u>{sub}</u>")
-            for t in grouped[cat][sub]:
-                status = (t.get("Статус") or "").lower()
-                done = "✅ " if status == "выполнено" else "⬜ "
-                pin = " 📌" if (t.get("Повтор") or "").strip() else ""
-                deadline = t.get("Дедлайн","")
-                title = t.get("Задача","")
-                lines.append(f"    {done}{title}{pin}  <i>(до {deadline})</i>")
-            lines.append("")  # пустая строка между группами
+    for cat, subs in groups.items():
+        lines.append(f"📂 <b>{cat}</b>")
+        for sub, items in subs.items():
+            lines.append(f"  └ <i>{sub}</i>")
+            for t in items:
+                status = (t.get("Статус","") or "").lower()
+                icon = "✅" if status == "выполнено" else "⬜"
+                dl = t.get("Дедлайн","") or ""
+                rep = t.get("Повторяемость","") or ""
+                rep_icon = " 🔁" if rep.strip() else ""
+                lines.append(f"    {icon} {t.get('Задача','')}{rep_icon}  (до {dl})")
+            lines.append("")  # пустая строка между подгруппами
+        lines.append("")      # пустая строка между категориями
     return "\n".join(lines).strip()
 
-def pretty_today(user_id):
-    d = now_tz().replace(hour=0, minute=0, second=0, microsecond=0)
-    header = f"📅 <b>Задачи на {fmt_date(d)}</b>\n"
-    body = pretty_day_block(user_id, d)
-    return header + "\n" + body
+def format_week_list(rows_by_date) -> str:
+    if not rows_by_date:
+        return "На неделю задач нет."
+    out = []
+    for date_s, items in rows_by_date:
+        out.append(f"🗓 <b>{weekday_name_ru(datetime.strptime(date_s,'%d.%m.%Y'))}</b> — <b>{date_s}</b>")
+        if not items:
+            out.append("  • Нет задач\n")
+            continue
+        for i, t in enumerate(items, 1):
+            rep_icon = " 🔁" if (t.get("Повторяемость","") or "").strip() else ""
+            dl = t.get("Дедлайн","") or ""
+            out.append(f"  {i}. {t.get('Задача','')}{rep_icon} (до {dl})")
+        out.append("")  # пробел между днями
+    return "\n".join(out).strip()
 
-def pretty_week(user_id):
-    start = now_tz().replace(hour=0, minute=0, second=0, microsecond=0)
-    blocks = [pretty_day_block(user_id, d) for d in next_7_dates(start)]
-    return "🗓 <b>Задачи на неделю</b>\n\n" + "\n\n".join(blocks)
-
-# =========================
-#          МЕНЮ
-# =========================
-
+# ---------------------------
+# Клавиатуры
+# ---------------------------
 def main_menu():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.add("📅 Сегодня", "📆 Неделя", "🗓 Вся неделя")
-    kb.add("➕ Добавить задачу", "✅ Отметить выполнение")
-    if OPENAI_API_KEY:
-        kb.add("🤖 Помощь AI")
+    kb.add("📅 Сегодня", "📆 Неделя")
+    kb.add("🗓 Вся неделя", "➕ Добавить задачу")
+    kb.add("ℹ️ Помощь")
     return kb
 
 def week_days_menu():
     kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    base = now_tz().replace(hour=0, minute=0, second=0, microsecond=0)
-    for d in next_7_dates(base):
-        kb.add(f"{day_name(d)} ({fmt_date(d)})")
+    today = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    for i in range(7):
+        d = today + timedelta(days=i)
+        kb.add(f"{weekday_name_ru(d)} ({d.strftime('%d.%m.%Y')})")
     kb.add("⬅ Назад")
     return kb
 
-# =========================
-#     ДОБАВЛЕНИЕ ЗАДАЧ
-# =========================
+# ---------------------------
+# GPT разбор намерений
+# ---------------------------
+def gpt_intent(user_text: str, today_str: str, week_dates_list: list) -> dict:
+    if not oai_client:
+        # Fallback: без GPT — простейшие эвристики
+        txt = user_text.lower()
+        if "сегодня" in txt:
+            return {"action":"list_today"}
+        if "недел" in txt and "вся" in txt:
+            return {"action":"list_week"}
+        if "перенес" in txt or "перенеси" in txt:
+            return {"action":"reschedule","task_query":user_text}
+        if "выполнил" in txt or "сделал" in txt:
+            return {"action":"mark_done","task_query":user_text}
+        if "добав" in txt:
+            return {"action":"add_task","free_text":user_text}
+        return {"action":"help"}
 
-user_steps = {}      # chat_id -> step
-temp_task_data = {}  # chat_id -> dict
+    # Подготавливаем "контекст" (минимум, чтобы не слать лишнего)
+    context = {
+        "today": today_str,
+        "week": week_dates_list
+    }
 
-@bot.message_handler(func=lambda m: m.text == "➕ Добавить задачу")
-def add_task_start(m):
-    user_steps[m.chat.id] = "date"
-    temp_task_data[m.chat.id] = {}
-    bot.send_message(m.chat.id, "Введите дату в формате <b>ДД.ММ.ГГГГ</b>:")
-
-@bot.message_handler(func=lambda m: user_steps.get(m.chat.id) == "date")
-def add_task_date(m):
-    if not re.match(r"^\d{2}\.\d{2}\.\d{4}$", m.text):
-        bot.send_message(m.chat.id, "❌ Неверный формат. Пример: 12.08.2025")
-        return
-    temp_task_data[m.chat.id]["date"] = m.text
-    user_steps[m.chat.id] = "category"
-    bot.send_message(m.chat.id, "Категория:")
-
-@bot.message_handler(func=lambda m: user_steps.get(m.chat.id) == "category")
-def add_task_category(m):
-    temp_task_data[m.chat.id]["category"] = m.text.strip() or "Без категории"
-    user_steps[m.chat.id] = "subcategory"
-    bot.send_message(m.chat.id, "Подкатегория:")
-
-@bot.message_handler(func=lambda m: user_steps.get(m.chat.id) == "subcategory")
-def add_task_subcategory(m):
-    temp_task_data[m.chat.id]["subcategory"] = m.text.strip() or "Общее"
-    user_steps[m.chat.id] = "title"
-    bot.send_message(m.chat.id, "Описание задачи:")
-
-@bot.message_handler(func=lambda m: user_steps.get(m.chat.id) == "title")
-def add_task_title(m):
-    temp_task_data[m.chat.id]["title"] = m.text.strip()
-    user_steps[m.chat.id] = "deadline"
-    bot.send_message(m.chat.id, "Дедлайн в формате <b>ЧЧ:ММ</b>:")
-
-@bot.message_handler(func=lambda m: user_steps.get(m.chat.id) == "deadline")
-def add_task_deadline(m):
-    if not re.match(r"^\d{2}:\d{2}$", m.text.strip()):
-        bot.send_message(m.chat.id, "❌ Неверный формат. Пример: 14:30")
-        return
-    data = temp_task_data[m.chat.id]
-    data["deadline"] = m.text.strip()
-    # Сохранение
-    add_task(
-        data["date"],
-        data["category"],
-        data["subcategory"],
-        data["title"],
-        data["deadline"],
-        m.chat.id
-    )
-    bot.send_message(m.chat.id, "✅ Задача добавлена!", reply_markup=main_menu())
-    user_steps.pop(m.chat.id, None)
-    temp_task_data.pop(m.chat.id, None)
-
-# =========================
-#     ОТМЕТКА ВЫПОЛНЕНИЯ
-# =========================
-
-@bot.message_handler(func=lambda m: m.text == "✅ Отметить выполнение")
-def ask_done_index(m):
-    today = fmt_date(now_tz())
-    tasks = get_tasks_for_date(m.chat.id, today)
-    if not tasks:
-        bot.send_message(m.chat.id, "Сегодня задач нет.")
-        return
-    # Покажем нумерованный список
-    lines = [f"📋 Выберите номер задачи на {today}:"]
-    for i, t in enumerate(tasks, 1):
-        lines.append(f"{i}. {t.get('Задача','')} (до {t.get('Дедлайн','')})")
-    bot.send_message(m.chat.id, "\n".join(lines))
-    user_steps[m.chat.id] = "done_wait_number"
-
-@bot.message_handler(func=lambda m: user_steps.get(m.chat.id) == "done_wait_number")
-def do_mark_done(m):
     try:
-        idx = int(m.text.strip()) - 1
-    except Exception:
-        bot.send_message(m.chat.id, "Введите номер, например: 2")
-        return
-    today = fmt_date(now_tz())
-    ok, info = mark_task_done_by_desc_for_user(m.chat.id, today, idx)
-    if ok:
-        bot.send_message(m.chat.id, f"✅ Задача «{info}» отмечена как выполненная!")
-    else:
-        bot.send_message(m.chat.id, f"❌ {info}")
-    user_steps.pop(m.chat.id, None)
+        msg = oai_client.chat.completions.create(
+            model="gpt-4o-mini",
+            temperature=0.2,
+            messages=[
+                {"role":"system","content":SYSTEM_PROMPT},
+                {"role":"user","content":f"Контекст: {json.dumps(context, ensure_ascii=False)}\nТекст: {user_text}"}
+            ],
+            response_format={"type":"json_object"},
+        )
+        raw = msg.choices[0].message.content
+        data = json.loads(raw)
+        return data
+    except Exception as e:
+        log.error(f"GPT intent error: {e}")
+        return {"action":"help"}
 
-# =========================
-#         КНОПКИ
-# =========================
-
+# ---------------------------
+# Обработчики команд / кнопок
+# ---------------------------
 @bot.message_handler(commands=["start"])
-def start_cmd(m):
-    bot.send_message(m.chat.id, "Добро пожаловать! Выберите действие:", reply_markup=main_menu())
+def on_start(message):
+    bot.send_message(
+        message.chat.id,
+        "Привет! Я твой ассистент по задачам. Выбирай действие ниже или просто пиши мне по-человечески, что нужно сделать 🤝",
+        reply_markup=main_menu()
+    )
+
+@bot.message_handler(func=lambda m: m.text == "ℹ️ Помощь")
+def on_help(message):
+    bot.send_message(message.chat.id,
+        "<b>Примеры:</b>\n"
+        "• «Покажи задачи на сегодня»\n"
+        "• «Вся неделя»\n"
+        "• «Я выполнил заказ табака»\n"
+        "• «Добавь завтра заказать кофе в 14:00»\n"
+        "• «Перенеси мой заказ кофе на пятницу 15:00»",
+        reply_markup=main_menu()
+    )
 
 @bot.message_handler(func=lambda m: m.text == "📅 Сегодня")
-def today_tasks(m):
-    schedule_repeating_today_and_next()  # на всякий — подкинем повторяющиеся на сегодня
-    bot.send_message(m.chat.id, pretty_today(m.chat.id))
+def on_today(message):
+    today = datetime.now(tz).strftime("%d.%m.%Y")
+    rows = tasks_for_date(message.chat.id, today)
+    txt = f"📅 <b>Задачи на {today}</b>\n\n" + format_tasks_grouped(rows, title_date=today)
+    bot.send_message(message.chat.id, txt)
 
 @bot.message_handler(func=lambda m: m.text == "📆 Неделя")
-def week_menu_handler(m):
-    bot.send_message(m.chat.id, "Выберите день недели:", reply_markup=week_days_menu())
+def on_week_menu(message):
+    bot.send_message(message.chat.id, "Выбери день недели:", reply_markup=week_days_menu())
 
 @bot.message_handler(func=lambda m: m.text == "🗓 Вся неделя")
-def all_week_tasks(m):
-    schedule_repeating_today_and_next()
-    bot.send_message(m.chat.id, pretty_week(m.chat.id))
+def on_week_all(message):
+    start = datetime.now(tz).replace(hour=0, minute=0, second=0, microsecond=0)
+    rows = tasks_for_week(message.chat.id, start)
+    # Сгруппируем по датам
+    bucket = defaultdict(list)
+    for r in rows:
+        bucket[r.get("Дата","")] += [r]
+    ordered = []
+    for d in week_dates(start):
+        ordered.append((d, bucket.get(d, [])))
+    bot.send_message(message.chat.id, format_week_list(ordered))
 
-@bot.message_handler(func=lambda msg: "(" in msg.text and ")" in msg.text and any(d in msg.text for d in RU_WEEKDAYS))
-def day_tasks(m):
+@bot.message_handler(func=lambda m: "(" in (m.text or "") and ")" in (m.text or ""))
+def on_day_pick(message):
+    # формат кнопки: "Среда (13.08.2025)"
     try:
-        date_str = m.text.split("(")[1].strip(")")
+        date_str = message.text.split("(")[1].strip(")")
     except Exception:
-        bot.send_message(m.chat.id, "Не удалось определить дату.")
+        date_str = ""
+    if not normalize_date_str(date_str):
+        bot.send_message(message.chat.id, "Не понял дату 🤔", reply_markup=main_menu())
         return
-    if not parse_date(date_str):
-        bot.send_message(m.chat.id, "Неверная дата.")
-        return
-    d = parse_date(date_str).replace(tzinfo=ZoneInfo(TIMEZONE))
-    bot.send_message(m.chat.id, pretty_day_block(m.chat.id, d))
+    rows = tasks_for_date(message.chat.id, date_str)
+    txt = f"📅 <b>Задачи на {date_str}</b>\n\n" + format_tasks_grouped(rows, title_date=date_str)
+    bot.send_message(message.chat.id, txt, reply_markup=main_menu())
 
 @bot.message_handler(func=lambda m: m.text == "⬅ Назад")
-def back_to_main(m):
-    bot.send_message(m.chat.id, "Главное меню:", reply_markup=main_menu())
+def on_back(message):
+    bot.send_message(message.chat.id, "Главное меню:", reply_markup=main_menu())
 
-# =========================
-#    УТРЕННЯЯ РАССЫЛКА
-# =========================
+# ---------------------------
+# Natural language (GPT ассистент)
+# ---------------------------
+def handle_intent(message, intent: dict):
+    uid = message.chat.id
+    today = datetime.now(tz)
+    today_s = today.strftime("%d.%m.%Y")
 
+    action = intent.get("action","help")
+    if action == "help":
+        return on_help(message)
+
+    if action == "list_today":
+        rows = tasks_for_date(uid, today_s)
+        bot.send_message(uid, f"📅 <b>Задачи на {today_s}</b>\n\n" + format_tasks_grouped(rows, title_date=today_s))
+        return
+
+    if action == "list_week":
+        start = today.replace(hour=0, minute=0, second=0, microsecond=0)
+        rows = tasks_for_week(uid, start)
+        bucket = defaultdict(list)
+        for r in rows:
+            bucket[r.get("Дата","")] += [r]
+        ordered = []
+        for d in week_dates(start):
+            ordered.append((d, bucket.get(d, [])))
+        bot.send_message(uid, format_week_list(ordered))
+        return
+
+    if action == "list_day":
+        d = intent.get("date","")
+        d = normalize_date_str(d)
+        if not d:
+            bot.send_message(uid, "Нужна дата в формате ДД.ММ.ГГГГ.")
+            return
+        rows = tasks_for_date(uid, d)
+        bot.send_message(uid, f"📅 <b>Задачи на {d}</b>\n\n" + format_tasks_grouped(rows, title_date=d))
+        return
+
+    if action == "mark_done":
+        query = (intent.get("task_query") or "").strip()
+        rows = tasks_for_date(uid, today_s)
+        if not rows:
+            bot.send_message(uid, "На сегодня нет задач для отметки.")
+            return
+        pick = fuzzy_pick_task(rows, query) if query else None
+        if not pick:
+            bot.send_message(uid, "Не нашёл задачу. Уточни название.")
+            return
+        # Найти в таблице: колонка "Задача" — 4, "Статус" — 6
+        try:
+            desc = pick.get("Задача","")
+            cell = tasks_ws.find(desc)
+            if cell:
+                tasks_ws.update_cell(cell.row, 6, "выполнено")
+                bot.send_message(uid, f"✅ Отметил: <b>{desc}</b>")
+            else:
+                bot.send_message(uid, "Не смог найти строку в таблице.")
+        except Exception as e:
+            log.exception(e)
+            bot.send_message(uid, "Ошибка при отметке задачи.")
+        return
+
+    if action == "add_task":
+        # Пытаемся собрать поля
+        date_s = normalize_date_str(intent.get("date","")) or today_s
+        category = intent.get("category","Без категории")
+        subcat = intent.get("subcategory","—")
+        desc = intent.get("task_query") or intent.get("free_text") or "Без описания"
+        deadline = intent.get("deadline","")
+        repeat = intent.get("repeat","")
+        try:
+            append_task(date_s, category, subcat, desc, deadline, uid, status="", repeat=repeat)
+            bot.send_message(uid, f"✅ Добавил задачу на <b>{date_s}</b>:\n• {desc} (до {deadline})")
+        except Exception as e:
+            log.exception(e)
+            bot.send_message(uid, "Не удалось добавить задачу.")
+        return
+
+    if action == "reschedule":
+        # Найти задачу (по умолчанию из сегодня), изменить дату/дедлайн
+        query = (intent.get("task_query") or "").strip()
+        new_date = normalize_date_str(intent.get("date","")) or today_s
+        new_deadline = intent.get("deadline","")
+        rows = filter_tasks_by_user(get_tasks_raw(), uid)
+        pick = fuzzy_pick_task(rows, query) if query else None
+        if not pick:
+            bot.send_message(uid, "Не нашёл задачу для переноса. Уточни название.")
+            return
+        try:
+            desc = pick.get("Задача","")
+            cell = tasks_ws.find(desc)
+            if cell:
+                # Колонки: 1-Дата, 5-Дедлайн
+                tasks_ws.update_cell(cell.row, 1, new_date)
+                if new_deadline:
+                    tasks_ws.update_cell(cell.row, 5, new_deadline)
+                bot.send_message(uid, f"🔁 Перенёс <b>{desc}</b> на <b>{new_date}</b>{(' '+new_deadline) if new_deadline else ''}")
+            else:
+                bot.send_message(uid, "Не смог найти строку в таблице.")
+        except Exception as e:
+            log.exception(e)
+            bot.send_message(uid, "Ошибка при переносе задачи.")
+        return
+
+    # На всякий случай
+    on_help(message)
+
+@bot.message_handler(func=lambda m: True)
+def on_any_text(message):
+    text = (message.text or "").strip()
+    # Кнопки и спец-команды уже перехвачены выше; здесь — свободный текст
+    today = datetime.now(tz)
+    intent = gpt_intent(text, today.strftime("%d.%m.%Y"), week_dates(today))
+    handle_intent(message, intent)
+
+# ---------------------------
+# Автоплан на 09:00
+# ---------------------------
 def send_daily_plan():
     try:
-        # 1) Сначала создаём повторяющиеся задачи на сегодня
-        schedule_repeating_today_and_next()
-
-        today = fmt_date(now_tz())
+        today_s = datetime.now(tz).strftime("%d.%m.%Y")
         for u in get_users():
             uid = u["id"]
-            tasks = get_tasks_for_date(uid, today)
-            if not tasks:
-                continue
-            msg = pretty_today(uid)
-            bot.send_message(uid, msg)
-        logger.info("Утренняя рассылка отправлена")
+            rows = tasks_for_date(uid, today_s)
+            if rows:
+                bot.send_message(uid, f"🌅 Доброе утро!\nВот твой план на <b>{today_s}</b>:\n\n" + format_tasks_grouped(rows, title_date=today_s))
     except Exception as e:
-        logger.exception("Ошибка в send_daily_plan: %s", e)
+        log.exception(e)
 
-def scheduler_loop():
-    # 09:00 локального времени TIMEZONE
-    schedule.every().day.at("09:00").do(send_daily_plan)
-    while True:
-        schedule.run_pending()
-        time.sleep(1)
+scheduler = BackgroundScheduler(timezone=tz)
+# Каждый день в 09:00 локального TZ
+scheduler.add_job(send_daily_plan, CronTrigger(hour=9, minute=0))
 
-# =========================
-#      ИНТЕГРАЦИЯ ChatGPT
-# =========================
-
-def ai_answer(prompt: str) -> str:
-    if not OPENAI_API_KEY:
-        return "AI недоступен: не задан OPENAI_API_KEY."
-    try:
-        # Используем официальную библиотеку openai>=1.0
-        from openai import OpenAI
-        client = OpenAI(api_key=OPENAI_API_KEY)
-        resp = client.chat.completions.create(
-            model=OPENAI_MODEL,
-            messages=[
-                {"role": "system", "content": "Ты помощник по личным задачам. Отвечай кратко и по делу."},
-                {"role": "user", "content": prompt}
-            ],
-            temperature=0.3,
-            max_tokens=500,
-        )
-        return resp.choices[0].message.content.strip()
-    except Exception as e:
-        logger.exception("AI error: %s", e)
-        return "Не удалось получить ответ от AI."
-
-@bot.message_handler(commands=["ask"])
-def ask_ai_cmd(m):
-    q = m.text.replace("/ask", "", 1).strip()
-    if not q:
-        bot.send_message(m.chat.id, "Напишите вопрос после команды: <code>/ask Как распределить задачи?</code>")
-        return
-    bot.send_message(m.chat.id, "Думаю…")
-    bot.send_message(m.chat.id, ai_answer(q))
-
-@bot.message_handler(func=lambda m: m.text == "🤖 Помощь AI")
-def ask_ai_button(m):
-    bot.send_message(m.chat.id, "Отправьте ваш вопрос в следующем сообщении. Начните с <b>/ask</b> ...")
-
-# =========================
-#          WEBHOOK
-# =========================
+# ---------------------------
+# Flask + Webhook
+# ---------------------------
+app = Flask(__name__)
 
 @app.route("/" + API_TOKEN, methods=["POST"])
-def webhook():
+def tg_webhook():
     try:
-        json_str = request.get_data().decode("utf-8")
+        json_str = request.get_data(as_text=True)
         update = telebot.types.Update.de_json(json_str)
         bot.process_new_updates([update])
     except Exception as e:
-        logger.exception("Ошибка обработки вебхука: %s", e)
+        log.exception(e)
         return "ERR", 500
     return "OK", 200
 
 @app.route("/")
 def home():
-    return "Bot is running!"
+    return "Bot is running!", 200
 
-def ensure_webhook():
+def setup_webhook():
+    # Удалим на всякий случай, затем установим
     try:
         bot.remove_webhook()
-        time.sleep(0.5)
-        ok = bot.set_webhook(url=WEBHOOK_URL, allowed_updates=[
-            "message", "callback_query"
-        ])
-        if ok:
-            logger.info("Webhook установлен: %s", WEBHOOK_URL)
-        else:
-            logger.error("Не удалось установить webhook (без исключения).")
-    except telebot.apihelper.ApiTelegramException as e:
-        # Частая причина 401 — неправильный токен
-        logger.exception("Ошибка Telegram set_webhook: %s", e)
-    except Exception as e:
-        logger.exception("Не удалось установить webhook: %s", e)
+    except Exception:
+        pass
+    webhook_url = f"{WEBHOOK_BASE}/{API_TOKEN}"
+    ok = bot.set_webhook(url=webhook_url, max_connections=40)
+    if ok:
+        log.info(f"Webhook set to: {webhook_url}")
+    else:
+        log.error("Failed to set webhook")
 
-# =========================
-#          MAIN
-# =========================
-
+# ---------------------------
+# Entry
+# ---------------------------
 if __name__ == "__main__":
-    # Без polling — только webhook, чтобы исключить 409 конфликты
-    ensure_webhook()
-
-    # Параллельно поднимем планировщик
-    threading.Thread(target=scheduler_loop, daemon=True).start()
-
-    # Flask-сервер для Telegram вебхука и Render health-check
-    port = int(os.getenv("PORT", "5000"))
-    app.run(host="0.0.0.0", port=port)
+    setup_webhook()
+    scheduler.start()
+    # Flask dev server (на Render это ок для простого сервиса)
+    app.run(host="0.0.0.0", port=int(os.getenv("PORT", "5000")))
