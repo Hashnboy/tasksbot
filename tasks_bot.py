@@ -1,19 +1,22 @@
+# tasks_bot.py
 # -*- coding: utf-8 -*-
-"""
-Финальная версия ассистента задач без листа «Все задачи».
-Поддержка: категории-листы (Кофейня, Табачка, Личное, WB), повторяемость, автопоставки,
-пагинация, подзадачи, массовые действия, напоминания, аналитика, NLP на OPENAI_API_KEY.
-"""
-
-import os, re, json, time, pytz, hmac, hashlib, logging, schedule, threading
-from datetime import datetime, timedelta, date
-from typing import List, Dict, Tuple
+import os
+import re
+import json
+import time
+import pytz
+import hmac
+import hashlib
+import logging
+import schedule
+import threading
+from datetime import datetime, timedelta
 
 import gspread
 from flask import Flask, request
 from telebot import TeleBot, types
 
-# ===================== ОКРУЖЕНИЕ =====================
+# ===================== ОКРУЖЕНИЕ / НАСТРОЙКИ =====================
 API_TOKEN        = os.getenv("TELEGRAM_TOKEN")
 TABLE_URL        = os.getenv("GOOGLE_SHEETS_URL")
 CREDENTIALS_FILE = os.getenv("GOOGLE_CREDENTIALS_JSON", "/etc/secrets/credentials.json")
@@ -21,265 +24,268 @@ WEBHOOK_BASE     = os.getenv("WEBHOOK_BASE")
 OPENAI_API_KEY   = os.getenv("OPENAI_API_KEY")
 TZ_NAME          = os.getenv("TZ", "Europe/Moscow")
 WEBHOOK_URL      = f"{WEBHOOK_BASE}/{API_TOKEN}" if API_TOKEN and WEBHOOK_BASE else None
-LOCAL_TZ         = pytz.timezone(TZ_NAME)
+
+LOCAL_TZ = pytz.timezone(TZ_NAME)
 
 logging.basicConfig(level=logging.INFO, format="%(asctime)s [%(levelname)s] %(message)s")
 log = logging.getLogger("tasksbot")
 
-# ===================== БОТ / SHEETS =====================
+REQUIRED_ENVS = ["TELEGRAM_TOKEN", "GOOGLE_SHEETS_URL", "WEBHOOK_BASE"]
+missing = [v for v in REQUIRED_ENVS if not os.getenv(v)]
+if missing:
+    log.warning("Не заданы переменные окружения: %s", ", ".join(missing))
+
 bot = TeleBot(API_TOKEN, parse_mode="HTML")
 
-# Листы категорий, которые ИЗНАЧАЛЬНО ДОЛЖНЫ существовать
-CATEGORY_SHEETS = ["Кофейня","Табачка","Личное","WB"]
-SHEETS: Dict[str, gspread.Worksheet] = {}
-ws_suppliers = ws_users = ws_logs = None
+# ===================== GOOGLE SHEETS =====================
+# Ключевые листы (категории задач)
+CATEGORIES = ["Кофейня", "Табачка", "Личное", "WB"]
+SHEET_SUPPLIERS = "Поставщики"
+SHEET_USERS     = "Пользователи"
+SHEET_LOGS      = "Логи"
 
-def connect_sheets():
-    global SHEETS, ws_suppliers, ws_users, ws_logs
+# Ожидаемая структура колонок на листах задач
+TASK_HEADERS = ["Дата","Категория","Подкатегория","Задача","Дедлайн","User ID","Статус","Повторяемость","Источник"]
+
+try:
     gc = gspread.service_account(filename=CREDENTIALS_FILE)
     sh = gc.open_by_url(TABLE_URL)
 
-    # Обязательные вспомогательные листы
-    for title in ["Поставщики", "Пользователи", "Логи"]:
+    # Проверяем наличие всех листов задач, но НЕ создаём
+    SHEETS = {}
+    for cat in CATEGORIES:
         try:
-            ws = sh.worksheet(title)
-            if title == "Поставщики": ws_suppliers = ws
-            elif title == "Пользователи": ws_users = ws
-            else: ws_logs = ws
+            SHEETS[cat] = sh.worksheet(cat)
         except gspread.exceptions.WorksheetNotFound:
-            log.error("Не найден обязательный лист: %s (создавать автоматически НЕ будем)", title)
-            raise
+            log.error(f"Не найден лист задач: {cat} (создавать автоматически НЕ будем)")
 
-    # Категорийные листы — только существующие
-    SHEETS.clear()
-    for title in CATEGORY_SHEETS:
-        try:
-            SHEETS[title] = sh.worksheet(title)
-        except gspread.exceptions.WorksheetNotFound:
-            log.warning("Не найден категорийный лист: %s (пропускаем, не создаём)", title)
+    try:
+        ws_suppliers = sh.worksheet(SHEET_SUPPLIERS)
+    except gspread.exceptions.WorksheetNotFound:
+        ws_suppliers = None
+        log.error("Лист 'Поставщики' не найден.")
 
-    if not SHEETS:
-        raise RuntimeError("Нет ни одного доступного категорийного листа. Проверь названия и регистр.")
+    try:
+        ws_users = sh.worksheet(SHEET_USERS)
+    except gspread.exceptions.WorksheetNotFound:
+        ws_users = None
+        log.error("Лист 'Пользователи' не найден.")
 
-    log.info("Google Sheets подключены. Доступные листы: %s", ", ".join(SHEETS.keys()))
+    try:
+        ws_logs = sh.worksheet(SHEET_LOGS)
+    except gspread.exceptions.WorksheetNotFound:
+        ws_logs = None
+        log.error("Лист 'Логи' не найден.")
 
-connect_sheets()
+    log.info("Google Sheets подключены.")
+except Exception:
+    log.error("Ошибка подключения к Google Sheets", exc_info=True)
+    raise
 
-TASKS_HEADERS = ["Дата","Категория","Подкатегория","Задача","Дедлайн","User ID","Статус","Повторяемость","Источник"]
+# ===================== УТИЛИТЫ / ОБЩЕЕ =====================
 PAGE_SIZE = 7
+NOTIFIED  = set()  # для напоминаний: ключ = taskId|date|HH:MM
 
-# ===================== УТИЛИТЫ ДАТ/ID =====================
-WEEKDAYS_RU = ["понедельник","вторник","среда","четверг","пятница","суббота","воскресенье"]
+def now_local():
+    return datetime.now(LOCAL_TZ)
 
-def now_local(): return datetime.now(LOCAL_TZ)
 def today_str(dt=None):
-    if dt is None: dt = now_local()
+    if dt is None:
+        dt = now_local()
     return dt.strftime("%d.%m.%Y")
+
 def weekday_ru(dt: datetime) -> str:
-    return ["Понедельник","Вторник","Среда","Четверг","Пятница","Суббота","Воскресенье"][dt.weekday()]
+    names = ["Понедельник","Вторник","Среда","Четверг","Пятница","Суббота","Воскресенье"]
+    return names[dt.weekday()]
 
-def parse_ru_date(s: str) -> date | None:
-    s = (s or "").strip()
-    if not s: return None
-    try: return datetime.strptime(s, "%d.%m.%Y").date()
-    except: return None
-
-def parse_time(s: str) -> Tuple[int,int] | None:
-    if not s: return None
-    m = re.fullmatch(r"(\d{1,2}):(\d{2})", s.strip())
-    if not m: return None
-    hh = int(m.group(1)); mm = int(m.group(2))
-    if 0 <= hh <= 23 and 0 <= mm <= 59: return hh, mm
-    return None
-
-def sha_task_id(row: Dict) -> str:
-    key = "|".join([str(row.get("Категория","")), str(row.get("Подкатегория","")), str(row.get("Задача","")),
-                    str(row.get("Дедлайн","")), str(row.get("User ID","")), str(row.get("Источник",""))])
-    return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+def parse_time_hhmm(s):
+    try:
+        return datetime.strptime(s, "%H:%M").time()
+    except Exception:
+        return None
 
 def log_event(user_id, action, payload=""):
+    if not ws_logs: return
     try:
         ws_logs.append_row([datetime.utcnow().isoformat(), str(user_id), action, payload], value_input_option="USER_ENTERED")
     except Exception:
         pass
 
-# ===================== ЧТЕНИЕ / ЗАПИСЬ ЗАДАЧ =====================
-def get_all_rows() -> List[Tuple[str, Dict]]:
-    """Вернёт [(sheet_title, row_dict), ...] без заголовка."""
-    acc = []
-    for title, ws in SHEETS.items():
+def sha_task_id(user_id, date_s, cat, subcat, text, deadline):
+    key = f"{user_id}|{date_s}|{cat}|{subcat}|{text}|{deadline}"
+    return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
+
+def is_order_task(text: str) -> bool:
+    t = (text or "").lower()
+    return any(w in t for w in ["заказ", "заказать"])
+
+def guess_supplier(text: str) -> str:
+    t = (text or "").lower()
+    if "к-экспро" in t or "к экспро" in t or "k-exp" in t or "кэкспро" in t:
+        return "К-Экспро"
+    if "вылегжан" in t:
+        return "ИП Вылегжанина"
+    return ""
+
+def normalize_tt_from_subcat(subcat: str) -> str:
+    s = (subcat or "").strip().lower()
+    if "центр" in s: return "Центр"
+    if "полет" in s or "полёт" in s: return "Полет"
+    if "климов" in s: return "Климово"
+    return subcat or ""
+
+def get_ws_by_category(cat: str):
+    return SHEETS.get(cat)
+
+def get_all_task_rows():
+    """Считать все задачи со всех категорий в общий список dict."""
+    all_rows = []
+    for cat, ws in SHEETS.items():
+        if not ws: 
+            continue
         try:
             rows = ws.get_all_records()
-            for r in rows:
-                # Насильная нормализация столбцов
-                for h in TASKS_HEADERS:
-                    r.setdefault(h, "")
-                r["Категория"] = r.get("Категория") or title
-                acc.append((title, r))
         except Exception as e:
-            log.error("Ошибка чтения листа %s: %s", title, e)
-    return acc
+            log.error(f"Не удалось прочитать лист {cat}: {e}")
+            rows = []
+        for r in rows:
+            r["Категория"] = r.get("Категория") or cat  # страховка
+            all_rows.append(r)
+    return all_rows
 
-def append_to_sheet(category: str, row: List[str]):
-    ws = SHEETS.get(category)
-    if not ws:
-        raise RuntimeError(f"Лист категории «{category}» недоступен (не существует или не подключён).")
-    ws.append_row(row, value_input_option="USER_ENTERED")
-
-def update_cell_by_match(category: str, match_row: Dict, col_name: str, value: str) -> bool:
-    """Обновит первую совпавшую строку по задачному id (без даты)"""
-    ws = SHEETS.get(category); 
-    if not ws: return False
-    rows = ws.get_all_records()
+def find_row_index_by_id(ws, task_id, rows):
+    # rows = ws.get_all_records(); индекс в таблице с 2-й строки
     for i, r in enumerate(rows, start=2):
-        probe = {"Категория":category, **r}
-        if sha_task_id(probe) == sha_task_id(match_row):
-            j = TASKS_HEADERS.index(col_name) + 1
-            ws.update_cell(i, j, value)
-            return True
-    return False
+        rid = sha_task_id(str(r.get("User ID")), r.get("Дата",""), r.get("Категория",""), r.get("Подкатегория",""), r.get("Задача",""), r.get("Дедлайн",""))
+        if rid == task_id:
+            return i
+    return None
 
-# ===================== ПРАВИЛА ПОСТАВЩИКОВ =====================
-SUPPLIER_RULES: Dict[str, Dict] = {}  # lower -> rule
+def append_task(cat, row_vals):
+    ws = get_ws_by_category(cat)
+    if not ws:
+        raise RuntimeError(f"Лист категории '{cat}' не найден.")
+    ws.append_row(row_vals, value_input_option="USER_ENTERED")
+
+def update_cell(ws, row_idx, col_name, value):
+    col = TASK_HEADERS.index(col_name) + 1
+    ws.update_cell(row_idx, col, value)
+
+# ===================== ПРАВИЛА ПОСТАВЩИКОВ (из листа) =====================
+# Поддерживаем такие типы логики:
+# 1) "каждые N дней" — ключевые слова: "каждые", число в правиле
+# 2) "shelf Xh / Xд" или поле "Хранение (дни) / Хранение_дней" — заказ после хранения
+SUPPLIER_RULES = {}
+
+def _safe_int(x, default=0):
+    try:
+        if x is None or x == "": return default
+        if isinstance(x, (int, float)): return int(x)
+        x = str(x).strip().replace(",", ".")
+        if x.endswith("д") or x.endswith("дн"):  # "3д"
+            x = re.findall(r"\d+", x)[0]
+        return int(float(x))
+    except Exception:
+        return default
 
 def load_supplier_rules_from_sheet():
     SUPPLIER_RULES.clear()
+    if not ws_suppliers:
+        log.warning("Лист 'Поставщики' недоступен — правила не загружены.")
+        return
     try:
         rows = ws_suppliers.get_all_records()
         for r in rows:
             name = str(r.get("Поставщик") or "").strip()
-            if not name: continue
-            key = name.lower()
-            rule = {
-                "domain": str(r.get("Правило") or "").strip().lower(),  # «кофейня»/«табачка» …
-                "order_deadline": str(r.get("ДедлайнЗаказа") or r.get("Дедлайн") or "14:00").strip(),
-                "delivery_offset_days": int(r.get("DeliveryOffsetDays") or 1),
-                "storage_hours": int(r.get("Хранение (дни)") or r.get("Хранение_дней") or 0) * 24,
-                "start_cycle": str(r.get("Старт_цикла") or "").strip(),
-                "auto": str(r.get("Авто") or "").strip(),
-                "active": str(r.get("Активен") or "").strip(),
-                "emoji": str(r.get("Emoji") or "📦").strip(),
-                "weekly": str(r.get("ДедлайнЗаказа Емодзи") or r.get("ДедлайнЗаказаСписком") or "").strip(),  # необяз.
-                "areas": str(r.get("ДедлайнЗаказа КатегорияЗаказа") or r.get("ДедлайнЗаказа") or r.get("ДедлайнЗаказаКатегория") or "").strip()
-            }
-            SUPPLIER_RULES[key] = rule
+            if not name: 
+                continue
+            active = str(r.get("Активен") or "").strip().lower() in ("1","да","true","y","yes","on")
+            auto   = str(r.get("Авто") or "").strip().lower() in ("1","да","true","y","yes","on")
+            rule_s = str(r.get("Правило") or "").strip().lower()
+            deadline = (str(r.get("ДедлайнЗаказа") or "14:00")).strip()
+            emoji = (str(r.get("Emoji") or "📦")).strip()
+
+            deliv_off = _safe_int(r.get("DeliveryOffsetDays"), 1)
+            storage_days = _safe_int(r.get("Хранение (дни)") or r.get("Хранение_дней"), 0)
+            start_cycle = str(r.get("Старт_цикла") or "").strip()  # опционально: ДД.ММ.ГГГГ
+
+            if not active:
+                continue
+
+            rule = {"name": name, "deadline": deadline, "emoji": emoji,
+                    "delivery_offset_days": max(0, deliv_off),
+                    "storage_days": max(0, storage_days),
+                    "auto": auto, "start_cycle": start_cycle}
+
+            # парсим «каждые N дней»
+            if "каждые" in rule_s:
+                nums = re.findall(r"\d+", rule_s)
+                rule["kind"] = "cycle_every_n_days"
+                rule["order_every_days"] = int(nums[0]) if nums else 2
+            elif "shelf" in rule_s or "час" in rule_s or "хран" in rule_s:
+                # хранение -> новый заказ после хранения
+                rule["kind"] = "delivery_shelf_then_order"
+                # storage_days уже учтён
+            else:
+                # дефолт — «каждые 2 дня»
+                rule["kind"] = "cycle_every_n_days"
+                rule["order_every_days"] = 2
+
+            SUPPLIER_RULES[name.lower()] = rule
     except Exception as e:
-        log.warning("Не смог загрузить правила поставщиков: %s", e)
+        log.warning(f"Не смог загрузить правила поставщиков: {e}")
 
 load_supplier_rules_from_sheet()
 
-def is_order_task(text: str) -> bool:
-    t = (text or "").lower()
-    return any(k in t for k in ["заказ","заказать","заказик"])
-
-def guess_supplier(text: str) -> str:
-    t = (text or "").lower()
-    keys = {
-        "к-экспро":"К-Экспро",
-        "к экспро":"К-Экспро",
-        "вылегжан":"ИП Вылегжанина",
-        "реал":"Реал",
-        "батч":"Батч",
-        "лобанов":"ИП Лобанов",
-        "авантаж":"Авантаж",
-        "федя":"Федя"
-    }
-    for k,v in keys.items():
-        if k in t: return v
-    return ""
-
-def normalize_tt_from_subcat(s: str) -> str:
-    s = (s or "").lower()
-    if "центр" in s: return "Центр"
-    if "полет" in s or "полёт" in s: return "Полет"
-    if "клим" in s: return "Климово"
-    return s.capitalize() if s else ""
-
-# ===================== ПОВТОРЯЕМОСТЬ: разбор и генерация =====================
-def parse_repeat(rep: str):
+def plan_next_by_supplier_rule(user_id, supplier_name, category, subcategory, base_task_text):
     """
-    Поддержка:
-    - дни недели: 'вторник', 'четверг', 'среда' ...
-    - 'каждые N дней'
-    - '72 часа' (эквивалент каждые 3 дня)
-    Возвращает dict вида {'type':'weekly','days':[1,3]} или {'type':'every_n','n':2}
+    При отметке заказа как выполненного: ставим приёмку и новый заказ по правилам поставщика.
     """
-    s = (rep or "").strip().lower()
-    if not s: return None
-    for i, w in enumerate(WEEKDAYS_RU):
-        if w in s:
-            days = [j for j, name in enumerate(WEEKDAYS_RU) if name in s]
-            return {"type":"weekly","days":days or [i]}
-    m = re.search(r"каждые?\s+(\d+)\s*д", s)
-    if m:
-        return {"type":"every_n","n":max(1,int(m.group(1)))}
-    m = re.search(r"(\d+)\s*час", s)
-    if m:
-        n = int(m.group(1))
-        return {"type":"every_n","n":max(1, n//24 or 1)}
-    return None
+    key = (supplier_name or "").strip().lower()
+    rule = SUPPLIER_RULES.get(key)
+    if not rule:
+        return []
 
-def expand_rows_for_range(rows: List[Tuple[str,Dict]], start: date, days: int, uid: str) -> List[Tuple[str,Dict]]:
-    """
-    На лету создаёт инстансы задач на интервал [start; start+days).
-    Берёт как строки с явной датой, так и шаблоны с Повторяемость.
-    """
-    end = start + timedelta(days=days)
-    out = []
-    for cat, r in rows:
-        # фильтр по владельцу
-        if str(r.get("User ID") or "").strip() and str(r.get("User ID")).strip() != str(uid):
-            continue
-        ds = parse_ru_date(r.get("Дата"))
-        if ds:
-            if start <= ds < end:
-                out.append((cat, r))
-            continue
+    created = []
+    today = now_local().date()
+    cat = category or "Кофейня"
+    sub = normalize_tt_from_subcat(subcategory)
 
-        # без даты: это «шаблон» с повторяемостью
-        rep = parse_repeat(r.get("Повторяемость"))
-        if not rep: 
-            continue
+    def _add(date_dt, text, deadline, source):
+        row = [
+            date_dt.strftime("%d.%m.%Y"),
+            cat, sub, text, deadline, str(user_id),
+            "", "", source
+        ]
+        append_task(cat, row)
 
-        # старт цикла может быть в Источнике: start:ДД.ММ.ГГГГ
-        m = re.search(r"start:(\d{2}\.\d{2}\.\d{4})", str(r.get("Источник","")))
-        start_cycle = parse_ru_date(m.group(1)) if m else start
+    if rule["kind"] == "cycle_every_n_days":
+        delivery_day = today + timedelta(days=rule.get("delivery_offset_days", 1))
+        next_order_day = today + timedelta(days=rule.get("order_every_days", 2))
+        _add(delivery_day, f"{rule['emoji']} Принять поставку {supplier_name} ({sub or '—'})", "10:00", f"auto:delivery:{supplier_name}")
+        _add(next_order_day, f"{rule['emoji']} Заказать {supplier_name} ({sub or '—'})", rule.get("deadline", "14:00"), f"auto:order:{supplier_name}")
+        created.append((delivery_day, next_order_day))
 
-        if rep["type"] == "weekly":
-            for i in range(days):
-                d = start + timedelta(days=i)
-                if d.weekday() in rep["days"]:
-                    inst = dict(r)
-                    inst["Дата"] = d.strftime("%d.%m.%Y")
-                    out.append((cat, inst))
-        elif rep["type"] == "every_n":
-            # шаг от start_cycle
-            n = rep["n"]
-            # найдём первое в диапазоне
-            cur = start_cycle
-            while cur < start:
-                cur += timedelta(days=n)
-            while cur < end:
-                inst = dict(r)
-                inst["Дата"] = cur.strftime("%d.%m.%Y")
-                out.append((cat, inst))
-                cur += timedelta(days=n)
-    return out
+    elif rule["kind"] == "delivery_shelf_then_order":
+        delivery_day = today + timedelta(days=rule.get("delivery_offset_days", 1))
+        # новый заказ после хранения (в днях)
+        next_order_day = delivery_day + timedelta(days=rule.get("storage_days", 2))
+        _add(delivery_day, f"{rule['emoji']} Принять поставку {supplier_name} ({sub or '—'})", "11:00", f"auto:delivery:{supplier_name}")
+        _add(next_order_day, f"{rule['emoji']} Заказать {supplier_name} ({sub or '—'})", rule.get("deadline", "14:00"), f"auto:order:{supplier_name}")
+        created.append((delivery_day, next_order_day))
 
-# ===================== ФОРМАТЫ / UI =====================
-def build_task_line(r, i=None):
-    dl = r.get("Дедлайн") or "—"
-    prefix = f"{i}. " if i else ""
-    return f"{prefix}{r.get('Категория','—')}/{r.get('Подкатегория','—')}: {r.get('Задача','')[:40]}… (до {dl})"
+    return created
 
+# ===================== ФОРМАТИРОВАНИЕ =====================
 def format_grouped(tasks, header_date=None):
-    if not tasks: return "Задач нет."
+    if not tasks:
+        return "Задач нет."
     def k(r):
         dl = r.get("Дедлайн") or ""
-        try: dlk = datetime.strptime(dl, "%H:%M").time()
-        except: dlk = datetime.min.time()
-        return (r.get("Категория",""), r.get("Подкатегория",""), dlk, r.get("Задача",""))
+        t = parse_time_hhmm(dl)
+        return (r.get("Категория",""), r.get("Подкатегория",""), t or datetime.min.time(), r.get("Задача",""))
     tasks = sorted(tasks, key=k)
+
     out = []
     if header_date:
         dt = datetime.strptime(header_date, "%d.%m.%Y")
@@ -302,25 +308,38 @@ def format_grouped(tasks, header_date=None):
         out.append(line)
     return "\n".join(out)
 
-def main_menu():
-    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
-    kb.row("📅 Сегодня","📆 Неделя")
-    kb.row("➕ Добавить","🔎 Найти","✅ Выполнить")
-    kb.row("🧠 Ассистент","📊 Отчёт","⚙️ Настройки")
-    return kb
+def build_task_line(r, i=None):
+    dl = r.get("Дедлайн") or "—"
+    prefix = f"{i}. " if i is not None else ""
+    return f"{prefix}{r.get('Категория','—')}/{r.get('Подкатегория','—')}: {r.get('Задача','')[:40]}… (до {dl})"
 
+def get_tasks_by_date(user_id, date_s):
+    uid = str(user_id)
+    rows = get_all_task_rows()
+    return [r for r in rows if str(r.get("User ID")) == uid and (r.get("Дата") or "") == date_s]
+
+def get_tasks_between(user_id, start_date: datetime.date, days=7):
+    uid = str(user_id)
+    date_set = {(start_date + timedelta(days=i)).strftime("%d.%m.%Y") for i in range(days)}
+    rows = get_all_task_rows()
+    return [r for r in rows if str(r.get("User ID")) == uid and (r.get("Дата") or "") in date_set]
+
+# ===================== ПАГИНАЦИЯ / INLINE CB =====================
 def mk_cb(action, **kwargs):
     payload = {"a": action, **kwargs}
     s = json.dumps(payload, ensure_ascii=False)
     sig = hmac.new(b"cb-key", s.encode("utf-8"), hashlib.sha1).hexdigest()[:6]
     return f"{sig}|{s}"
+
 def parse_cb(data):
     try:
         sig, s = data.split("|", 1)
         check = hmac.new(b"cb-key", s.encode("utf-8"), hashlib.sha1).hexdigest()[:6]
-        if sig != check: return None
+        if sig != check:
+            return None
         return json.loads(s)
-    except Exception: return None
+    except Exception:
+        return None
 
 def page_buttons(items, page, total_pages, prefix_action):
     kb = types.InlineKeyboardMarkup()
@@ -330,73 +349,130 @@ def page_buttons(items, page, total_pages, prefix_action):
     if page > 1: nav.append(types.InlineKeyboardButton("⬅️", callback_data=mk_cb("page", p=page-1, pa=prefix_action)))
     nav.append(types.InlineKeyboardButton(f"{page}/{total_pages}", callback_data="noop"))
     if page < total_pages: nav.append(types.InlineKeyboardButton("➡️", callback_data=mk_cb("page", p=page+1, pa=prefix_action)))
-    if nav: kb.row(*nav)
+    if nav:
+        kb.row(*nav)
     return kb
 
-# ===================== GPT (NLP + ассистент) =====================
-def ai_parse_to_suggest(text):
-    """
-    Возвращает словарь-подсказку: category, subcategory, supplier, date, time, repeat
-    """
-    suggestion = {"category":"","subcategory":"","supplier":"","date":"","time":"","repeat":""}
-    tl = text.lower()
-    suggestion["supplier"] = guess_supplier(text)
-    if "кофейн" in tl or suggestion["supplier"] in ["К-Экспро","ИП Вылегжанина","Реал","Батч","ИП Лобанов","Авантаж"]:
-        suggestion["category"] = "Кофейня"
-    elif "табач" in tl or suggestion["supplier"] == "Федя":
-        suggestion["category"] = "Табачка"
-    m = re.search(r"(центр|пол[её]т|климово)", tl)
-    if m: suggestion["subcategory"] = normalize_tt_from_subcat(m.group(1))
-    m = re.search(r"(\d{1,2}:\d{2})", text)
-    if m: suggestion["time"] = m.group(1)
-    if any(w in tl for w in ["сегодня","today"]): suggestion["date"] = today_str()
-    elif any(w in tl for w in ["завтра","tomorrow"]): suggestion["date"] = today_str(now_local()+timedelta(days=1))
-    m = re.search(r"(\d{2}\.\d{2}\.\d{4})", text); 
-    if m: suggestion["date"] = m.group(1)
-    # repeat
-    for w in WEEKDAYS_RU:
-        if w in tl: suggestion["repeat"] = w
-    m = re.search(r"каждые?\s+\d+\s*д", tl)
-    if m: suggestion["repeat"] = m.group(0)
-    m = re.search(r"\d+\s*час", tl)
-    if m: suggestion["repeat"] = m.group(0)
+def render_task_card(uid, task_id):
+    # ищем задачу и конкретный лист
+    for cat, ws in SHEETS.items():
+        if not ws: 
+            continue
+        rows = ws.get_all_records()
+        idx = find_row_index_by_id(ws, task_id, rows)
+        if not idx:
+            continue
+        r = rows[idx-2]
+        if str(r.get("User ID")) != str(uid):
+            continue
+        date_s = r.get("Дата","")
+        header = (
+            f"<b>{r.get('Задача','')}</b>\n"
+            f"📅 {weekday_ru(datetime.strptime(date_s,'%d.%m.%Y'))} — {date_s}\n"
+            f"📁 {r.get('Категория',cat)} / {r.get('Подкатегория','—')}\n"
+            f"⏰ Дедлайн: {r.get('Дедлайн') or '—'}\n"
+            f"📝 Статус: {r.get('Статус') or '—'}"
+        )
+        kb = types.InlineKeyboardMarkup()
+        kb.add(types.InlineKeyboardButton("✅ Выполнить", callback_data=mk_cb("done", id=task_id)))
+        if is_order_task(r.get("Задача","")):
+            kb.add(types.InlineKeyboardButton("🚚 Принять поставку", callback_data=mk_cb("accept_delivery", id=task_id)))
+        kb.add(types.InlineKeyboardButton("➕ Подзадача", callback_data=mk_cb("add_sub", id=task_id)))
+        kb.add(types.InlineKeyboardButton("⏰ Напоминание", callback_data=mk_cb("remind_set", id=task_id)))
+        kb.add(types.InlineKeyboardButton("❌ Закрыть", callback_data=mk_cb("close_card")))
+        return header, kb
+    return "Задача не найдена.", None
 
-    # при наличии OPENAI — уточнение (без флуда)
+# ===================== МЕНЮ =====================
+def main_menu():
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row("📅 Сегодня", "📆 Неделя")
+    kb.row("➕ Добавить", "🧩 Мастер добавления", "🔎 Найти")
+    kb.row("✅ Выполнить", "🚚 Закупочный день", "🧠 Ассистент")
+    kb.row("⚙️ Настройки")
+    return kb
+
+def supply_menu():
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row("📦 Заказы сегодня", "📥 Приёмки сегодня")
+    kb.row("🆕 Добавить поставщика", "⬅ Назад")
+    return kb
+
+# ===================== GPT: ПАРСИНГ / АССИСТЕНТ =====================
+def ai_parse_to_tasks(text, fallback_user_id):
+    """
+    Возвращает список объектов:
+    {date, time, category, subcategory, task, repeat, supplier}
+    """
+    items = []
+    used_ai = False
     if OPENAI_API_KEY:
         try:
             from openai import OpenAI
             client = OpenAI(api_key=OPENAI_API_KEY)
-            sys = ("Ты парсер задач. Верни ТОЛЬКО JSON с полями: "
-                   "category, subcategory, supplier, date(ДД.ММ.ГГГГ|''), time(ЧЧ:ММ|''), repeat(''|строка описания).")
+            sys = (
+                "Ты парсер задач. Верни ТОЛЬКО JSON-массив объектов.\n"
+                "Объект: {date:'ДД.ММ.ГГГГ'|'' , time:'ЧЧ:ММ'|'' , category:'Кофейня|Табачка|Личное|WB'|'' , "
+                "subcategory:'' , task:'', repeat:''|описание , supplier:''|имя}.\n"
+                "Если есть слова 'К-Экспро' или 'ИП Вылегжанина' — это заказ. "
+                "Подкатегория может быть 'Центр'/'Полет', если встречается."
+            )
             resp = client.chat.completions.create(
                 model="gpt-4o-mini",
                 messages=[{"role":"system","content":sys},{"role":"user","content":text}],
                 temperature=0.1
             )
             raw = resp.choices[0].message.content.strip()
-            ai = json.loads(raw)
-            for k in suggestion.keys():
-                if ai.get(k): suggestion[k] = ai[k]
+            parsed = json.loads(raw)
+            if isinstance(parsed, dict): parsed = [parsed]
+            for it in parsed:
+                items.append({
+                    "date": it.get("date") or "",
+                    "time": it.get("time") or "",
+                    "category": it.get("category") or "",
+                    "subcategory": it.get("subcategory") or "",
+                    "task": it.get("task") or "",
+                    "repeat": it.get("repeat") or "",
+                    "supplier": it.get("supplier") or ""
+                })
+            used_ai = True
         except Exception as e:
-            log.warning("AI parse hint failed: %s", e)
-    return suggestion
+            log.error(f"AI parse failed: {e}")
+
+    if not used_ai:
+        # фоллбек
+        tl = text.lower()
+        cat = ""
+        if any(x in tl for x in ["кофейн","к-экспро","вылегжан"]): cat = "Кофейня"
+        elif "табач" in tl: cat = "Табачка"
+        elif "wb" in tl: cat = "WB"
+        else: cat = "Личное"
+        sub = "Центр" if "центр" in tl else ("Полет" if ("полет" in tl or "полёт" in tl) else "")
+        dl = re.search(r"(\d{1,2}:\d{2})", text)
+        deadline = dl.group(1) if dl else ""
+        if "сегодня" in tl: d = today_str()
+        elif "завтра" in tl: d = today_str(now_local()+timedelta(days=1))
+        else:
+            m = re.search(r"(\d{2}\.\d{2}\.\d{4})", text); d = m.group(1) if m else ""
+        items = [{
+            "date": d, "time": deadline, "category": cat, "subcategory": sub,
+            "task": text.strip(), "repeat":"", "supplier":""
+        }]
+    return items
 
 def ai_assist_answer(query, user_id):
     try:
-        # контекст — неделя вперёд
-        start = now_local().date()
-        rows = get_all_rows()
-        expanded = expand_rows_for_range(rows, start, 7, str(user_id))
+        rows = get_tasks_between(user_id, now_local().date(), 7)
         brief = []
-        for _, r in sorted(expanded, key=lambda x: (datetime.strptime(x[1]["Дата"], "%d.%m.%Y"), x[1].get("Дедлайн","") or "", x[1].get("Задача","") or "")):
+        for r in sorted(rows, key=lambda x: (datetime.strptime(x["Дата"], "%d.%m.%Y"), x.get("Дедлайн","") or "", x.get("Задача","") or "")):
             brief.append(f"{r['Дата']} • {r['Категория']}/{r['Подкатегория'] or '—'} — {r['Задача']} (до {r['Дедлайн'] or '—'}) [{r.get('Статус','')}]")
         context = "\n".join(brief)[:4000]
         if not OPENAI_API_KEY:
-            return "Совет: сначала срочные/важные, затем короткие победы. Блокируй время под поставки и заказы."
+            return "Совет: начни с задач с ближайшим дедлайном; крупные задачи разбей на 2–3 подзадачи."
         from openai import OpenAI
         client = OpenAI(api_key=OPENAI_API_KEY)
-        sys = "Ты ассистент по задачам. Суммируй чётко и кратко, пунктами, на русском."
-        prompt = f"Запрос: {query}\n\nЗадачи на неделю:\n{context}\n\nСформируй план действий и предложи 2-3 автодобавления."
+        sys = "Ты операционный ассистент по задачам и закупкам. Отвечай кратко, буллетами, на русском."
+        prompt = f"Запрос: {query}\n\nКонтекст задач на 7 дней:\n{context}"
         resp = client.chat.completions.create(
             model="gpt-4o-mini",
             messages=[{"role":"system","content":sys},{"role":"user","content":prompt}],
@@ -404,497 +480,631 @@ def ai_assist_answer(query, user_id):
         )
         return resp.choices[0].message.content.strip()
     except Exception as e:
-        log.error("AI assistant error: %s", e)
+        log.error(f"AI assistant error: {e}")
         return "Не удалось сформировать ответ ассистента."
 
-# ===================== ДОБАВЛЕНИЕ ЗАДАЧ (мастер по кнопкам) =====================
-ADD_WIZARD: Dict[int, Dict] = {}  # uid -> {title, category, subcategory, date, time, repeat}
+# ===================== СОСТОЯНИЯ ПОЛЬЗОВАТЕЛЯ =====================
+USER_STATE = {}   # uid -> state
+USER_DATA  = {}   # uid -> dict
 
-def start_add_wizard(uid, title):
-    hint = ai_parse_to_suggest(title)
-    ADD_WIZARD[uid] = {"title": title, **hint}
+def set_state(uid, state, data=None):
+    USER_STATE[uid] = state
+    if data is not None:
+        USER_DATA[uid] = data
 
-def add_wizard_kb(uid):
-    st = ADD_WIZARD.get(uid, {})
-    kb = types.InlineKeyboardMarkup()
-    # 1) Категория
-    row = []
-    for cat in CATEGORY_SHEETS:
-        if cat in SHEETS:
-            label = "✅ "+cat if st.get("category")==cat else cat
-            row.append(types.InlineKeyboardButton(label, callback_data=mk_cb("w_cat", v=cat)))
-    if row: kb.row(*row)
-    # 2) Подкатегория
-    for chunk in [["Центр","Полет","Климово"],["—"]]:
-        row=[]
-        for sub in chunk:
-            sel = normalize_tt_from_subcat(sub) if sub!="—" else ""
-            label = ("✅ "+(sel or "—")) if (st.get("subcategory") or "")==sel else (sel or "—")
-            row.append(types.InlineKeyboardButton(label, callback_data=mk_cb("w_sub", v=sel)))
-        kb.row(*row)
-    # 3) Дата
-    today = now_local().date()
-    row=[]
-    for d,cap in [(today,"Сегодня"),(today+timedelta(days=1),"Завтра"),(today+timedelta(days=2),"+2"),(today+timedelta(days=7),"+7")]:
-        ds = d.strftime("%d.%m.%Y")
-        label = "✅ "+cap if st.get("date")==ds else cap
-        row.append(types.InlineKeyboardButton(label, callback_data=mk_cb("w_date", v=ds)))
-    kb.row(*row)
-    kb.row(types.InlineKeyboardButton("📅 Ввести дату", callback_data=mk_cb("w_date_manual")))
-    # 4) Время
-    row=[]
-    for t in ["10:00","12:00","14:00","16:00"]:
-        label = "✅ "+t if st.get("time")==t else t
-        row.append(types.InlineKeyboardButton(label, callback_data=mk_cb("w_time", v=t)))
-    kb.row(*row)
-    kb.row(types.InlineKeyboardButton("⏰ Ввести время", callback_data=mk_cb("w_time_manual")))
-    # 5) Повторяемость
-    row=[]
-    for r in ["","понедельник","вторник","среда","четверг","пятница","суббота","воскресенье","каждые 2 дня","каждые 3 дня"]:
-        label = "🔁 "+(r or "нет") if st.get("repeat")==r else (r or "без повтора")
-        row.append(types.InlineKeyboardButton(label, callback_data=mk_cb("w_rep", v=r)))
-        if len(row)==3: kb.row(*row); row=[]
-    if row: kb.row(*row)
-    # 6) Сохранить
-    kb.row(types.InlineKeyboardButton("✅ Добавить", callback_data=mk_cb("w_save")))
-    kb.row(types.InlineKeyboardButton("❌ Отмена", callback_data=mk_cb("w_cancel")))
-    return kb
+def get_state(uid):
+    return USER_STATE.get(uid)
 
-def finish_wizard(uid):
-    st = ADD_WIZARD.get(uid, {})
-    cat = st.get("category") or "Личное"
-    sub = st.get("subcategory") or ""
-    title = st.get("title") or ""
-    date_s = st.get("date") or today_str()
-    time_s = st.get("time") or ""
-    repeat = st.get("repeat") or ""
-    row = [date_s, cat, sub, title, time_s, str(uid), "", repeat, "wizard"]
-    append_to_sheet(cat, row)
-    if is_order_task(title):
-        # предложим «Принять поставку»
-        supplier = guess_supplier(title) or "Поставка"
-        # по умолчанию — завтра 10:00
-        ds = parse_ru_date(date_s) or now_local().date()
-        accept_day = (ds + timedelta(days=1)).strftime("%d.%m.%Y")
-        sub_row = [accept_day, cat, sub,
-                   f"🚚 Принять поставку {supplier} ({normalize_tt_from_subcat(sub) or '—'})",
-                   "10:00", str(uid), "", "", f"subtask:{sha_task_id({'Категория':cat,'Подкатегория':sub,'Задача':title,'Дедлайн':time_s,'User ID':uid})}"]
-        append_to_sheet(cat, sub_row)
-    return cat
+def get_data(uid):
+    return USER_DATA.get(uid, {})
 
-# ===================== ХЕНДЛЕРЫ =====================
+def clear_state(uid):
+    USER_STATE.pop(uid, None)
+    USER_DATA.pop(uid, None)
+
+# ===================== ХЕЛПЕРЫ ДЛЯ ДОБАВЛЕНИЯ =====================
+def add_task_smart(cat, date_s, subcat, text, deadline, user_id, repeat="", source=""):
+    row = [date_s, cat, subcat, text, deadline, str(user_id), "", repeat, source]
+    append_task(cat, row)
+
+def mark_done_by_id(task_id, user_id):
+    for cat, ws in SHEETS.items():
+        if not ws: continue
+        rows = ws.get_all_records()
+        idx = find_row_index_by_id(ws, task_id, rows)
+        if not idx: 
+            continue
+        r = rows[idx-2]
+        if str(r.get("User ID")) != str(user_id):
+            return False, None
+        update_cell(ws, idx, "Статус", "выполнено")
+        return True, r
+    return False, None
+
+# ===================== ОБРАБОТЧИКИ КОМАНД/МЕНЮ =====================
 @bot.message_handler(commands=["start"])
 def cmd_start(m):
-    bot.send_message(m.chat.id, "Привет! Я готов. Выбирай действие:", reply_markup=main_menu())
-
-@bot.message_handler(func=lambda msg: msg.text == "➕ Добавить")
-def handle_add(m):
-    uid = m.chat.id
-    bot.send_message(uid, "Напиши название задачи одной строкой. Я подскажу параметры и дам кнопки.")
-    bot.register_next_step_handler(m, add_step_title)
-
-def add_step_title(m):
-    uid = m.chat.id
-    title = m.text.strip()
-    start_add_wizard(uid, title)
-    st = ADD_WIZARD[uid]
-    bot.send_message(uid, f"Задача: <b>{st['title']}</b>\nВыбери параметры 👇", reply_markup=add_wizard_kb(uid))
-
-@bot.callback_query_handler(func=lambda c: parse_cb(c.data) and parse_cb(c.data).get("a","").startswith("w_"))
-def wizard_callbacks(c):
-    uid = c.message.chat.id
-    data = parse_cb(c.data)
-    a = data.get("a"); v = data.get("v","")
-    st = ADD_WIZARD.get(uid, {})
-    if not st: 
-        bot.answer_callback_query(c.id,"Мастер закрыт"); return
-    if a == "w_cat": st["category"] = v
-    elif a == "w_sub": st["subcategory"] = v
-    elif a == "w_date": st["date"] = v
-    elif a == "w_time": st["time"] = v
-    elif a == "w_rep": st["repeat"] = v
-    elif a == "w_date_manual":
-        bot.answer_callback_query(c.id); bot.send_message(uid,"Введи дату ДД.ММ.ГГГГ:")
-        bot.register_next_step_handler(c.message, wizard_date_manual); return
-    elif a == "w_time_manual":
-        bot.answer_callback_query(c.id); bot.send_message(uid,"Введи время ЧЧ:ММ:")
-        bot.register_next_step_handler(c.message, wizard_time_manual); return
-    elif a == "w_save":
-        cat = finish_wizard(uid)
-        ADD_WIZARD.pop(uid, None)
-        bot.answer_callback_query(c.id,"Добавил!")
-        bot.edit_message_text("✅ Задача добавлена.", uid, c.message.message_id)
-        log_event(uid, "add_task_wizard", st.get("title",""))
-        return
-    elif a == "w_cancel":
-        ADD_WIZARD.pop(uid, None)
-        bot.answer_callback_query(c.id,"Отменено")
-        bot.edit_message_text("Отмена.", uid, c.message.message_id)
-        return
-    ADD_WIZARD[uid] = st
-    try:
-        bot.edit_message_reply_markup(uid, c.message.message_id, reply_markup=add_wizard_kb(uid))
-    except Exception:
-        pass
-    bot.answer_callback_query(c.id)
-
-def wizard_date_manual(m):
-    uid = m.chat.id
-    ds = m.text.strip()
-    try: datetime.strptime(ds, "%d.%m.%Y")
-    except: bot.send_message(uid,"Некорректная дата."); return
-    ADD_WIZARD.setdefault(uid, {})["date"] = ds
-    bot.send_message(uid,"Ок. Продолжай выбор кнопками.", reply_markup=add_wizard_kb(uid))
-
-def wizard_time_manual(m):
-    uid = m.chat.id
-    ts = m.text.strip()
-    if not re.fullmatch(r"\d{1,2}:\d{2}", ts):
-        bot.send_message(uid,"Некорректное время."); return
-    ADD_WIZARD.setdefault(uid, {})["time"] = ts
-    bot.send_message(uid,"Ок. Продолжай выбор кнопками.", reply_markup=add_wizard_kb(uid))
+    bot.send_message(m.chat.id, "Привет! Я твой ассистент по задачам и закупкам. Что делаем?", reply_markup=main_menu())
 
 @bot.message_handler(func=lambda msg: msg.text == "📅 Сегодня")
 def handle_today(m):
     uid = m.chat.id
-    start = now_local().date()
-    rows = get_all_rows()
-    expanded = expand_rows_for_range(rows, start, 1, str(uid))
-    tasks = [r for _, r in expanded if r["Дата"] == start.strftime("%d.%m.%Y")]
-    if not tasks:
-        bot.send_message(uid, f"На сегодня задач нет.", reply_markup=main_menu()); return
-    by_cat = {}
-    for r in tasks:
-        by_cat.setdefault(r["Категория"], []).append(r)
-    parts=[]
-    for dcat in by_cat:
-        parts.append(format_grouped(by_cat[dcat], header_date=today_str()))
-        parts.append("")
-    bot.send_message(uid, "\n".join(parts), reply_markup=main_menu())
+    d = today_str()
+    rows = get_tasks_by_date(uid, d)
+    if not rows:
+        bot.send_message(uid, f"📅 Задачи на {d}\n\nЗадач нет.", reply_markup=main_menu()); return
+    # список -> карточки (inline)
+    items = []
+    for r in rows:
+        tid = sha_task_id(str(r.get("User ID")), r.get("Дата",""), r.get("Категория",""), r.get("Подкатегория",""), r.get("Задача",""), r.get("Дедлайн",""))
+        items.append((build_task_line(r), tid))
+    page = 1
+    total_pages = (len(items)+PAGE_SIZE-1)//PAGE_SIZE
+    slice_items = items[(page-1)*PAGE_SIZE:page*PAGE_SIZE]
+    kb = page_buttons(slice_items, page, total_pages, prefix_action="open")
+    header = f"📅 Задачи на {d}\n\n" + format_grouped(rows, header_date=d)
+    bot.send_message(uid, header, reply_markup=main_menu())
+    bot.send_message(uid, "Открой карточку задачи:", reply_markup=kb)
 
 @bot.message_handler(func=lambda msg: msg.text == "📆 Неделя")
 def handle_week(m):
     uid = m.chat.id
-    start = now_local().date()
-    rows = get_all_rows()
-    expanded = expand_rows_for_range(rows, start, 7, str(uid))
-    if not expanded:
+    tasks = get_tasks_between(uid, now_local().date(), 7)
+    if not tasks:
         bot.send_message(uid, "На неделю задач нет.", reply_markup=main_menu()); return
-    by_day: Dict[str, List[Dict]] = {}
-    for _, r in expanded:
+    by_day = {}
+    for r in tasks:
         by_day.setdefault(r["Дата"], []).append(r)
-    parts=[]
+    parts = []
     for d in sorted(by_day.keys(), key=lambda s: datetime.strptime(s, "%d.%m.%Y")):
-        parts.append(format_grouped(by_day[d], header_date=d)); parts.append("")
+        parts.append(format_grouped(by_day[d], header_date=d))
+        parts.append("")
     bot.send_message(uid, "\n".join(parts), reply_markup=main_menu())
+
+@bot.message_handler(func=lambda msg: msg.text == "➕ Добавить")
+def handle_add_free(m):
+    uid = m.chat.id
+    set_state(uid, "adding_text")
+    bot.send_message(uid, "Опиши задачу одним сообщением. Я распаршу дату/время/категорию.\nНапр.: «Заказать К-Экспро Центр завтра до 14:00»")
+
+@bot.message_handler(func=lambda msg: msg.text == "🧩 Мастер добавления")
+def handle_add_wizard(m):
+    uid = m.chat.id
+    set_state(uid, "wizard_cat")
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row(*CATEGORIES)
+    kb.row("⬅ Отмена")
+    bot.send_message(uid, "Выбери категорию:", reply_markup=kb)
 
 @bot.message_handler(func=lambda msg: msg.text == "🔎 Найти")
 def handle_search(m):
     uid = m.chat.id
-    bot.send_message(uid,"Что ищем? Введи часть названия/категории/подкатегории/даты.")
-    bot.register_next_step_handler(m, search_query)
-
-def search_query(m):
-    uid = m.chat.id
-    q = m.text.strip().lower()
-    rows = get_all_rows()
-    found=[]
-    for cat, r in rows:
-        if str(r.get("User ID") or "").strip() and str(r["User ID"]) != str(uid):
-            continue
-        hay = " ".join([str(r.get(k,"")) for k in TASKS_HEADERS]).lower()
-        if q in hay:
-            tid = sha_task_id({"Категория":cat, **r})
-            found.append((build_task_line(r), tid))
-    if not found:
-        bot.send_message(uid, "Ничего не найдено.", reply_markup=main_menu()); return
-    total_pages = (len(found)+PAGE_SIZE-1)//PAGE_SIZE
-    page = 1
-    slice_items = found[(page-1)*PAGE_SIZE:page*PAGE_SIZE]
-    kb = page_buttons(slice_items, page, total_pages, prefix_action="open")
-    bot.send_message(uid, "Найденные задачи:", reply_markup=kb)
+    set_state(uid, "search_text")
+    bot.send_message(uid, "Что ищем? Введи часть названия/категории/подкатегории/даты.")
 
 @bot.message_handler(func=lambda msg: msg.text == "✅ Выполнить")
-def handle_done_prompt(m):
+def handle_done_menu(m):
     uid = m.chat.id
-    bot.send_message(uid, "Напиши часть названия/поставщика. Я предложу задачи на сегодня для завершения.")
-    bot.register_next_step_handler(m, done_text)
+    set_state(uid, "done_text")
+    bot.send_message(uid, "Напиши, что выполнено. Примеры:\n<b>сделал заказ к-экспро центр</b>\n<b>закрыли заказ вылегжанина</b>")
 
-def done_text(m):
+@bot.message_handler(func=lambda msg: msg.text == "🚚 Закупочный день")
+def handle_supply(m):
+    bot.send_message(m.chat.id, "Меню закупок:", reply_markup=supply_menu())
+
+@bot.message_handler(func=lambda msg: msg.text == "📦 Заказы сегодня")
+def handle_today_orders(m):
     uid = m.chat.id
-    q = m.text.strip().lower()
-    start = now_local().date()
-    rows = get_all_rows()
-    today_tasks = [r for _, r in expand_rows_for_range(rows, start, 1, str(uid))]
-    cand=[]
-    for cat, r in today_tasks:
-        if r.get("Статус","").lower()=="выполнено": continue
-        hay = " ".join([r.get("Задача",""), r.get("Категория",""), r.get("Подкатегория",""), r.get("Источник","")]).lower()
-        if q in hay:
-            cand.append((cat, r))
-    if not cand:
-        bot.send_message(uid,"Ничего не нашёл на сегодня.")
-        return
+    date_s = today_str()
+    rows = get_tasks_by_date(uid, date_s)
+    orders = [r for r in rows if is_order_task(r.get("Задача",""))]
+    if not orders:
+        bot.send_message(uid, "Сегодня заказов нет.", reply_markup=supply_menu()); return
+    items = []
+    for i,r in enumerate(orders, start=1):
+        tid = sha_task_id(str(r.get("User ID")), r.get("Дата",""), r.get("Категория",""), r.get("Подкатегория",""), r.get("Задача",""), r.get("Дедлайн",""))
+        items.append((build_task_line(r, i), tid))
     kb = types.InlineKeyboardMarkup()
-    for i,(cat, r) in enumerate(cand, start=1):
-        tid = sha_task_id({"Категория":cat, **r})
-        kb.add(types.InlineKeyboardButton(build_task_line(r,i), callback_data=mk_cb("done", id=tid)))
-    bot.send_message(uid, "Что отметить выполненным?", reply_markup=kb)
+    for text, tid in items:
+        kb.add(types.InlineKeyboardButton(text, callback_data=mk_cb("open", id=tid)))
+    bot.send_message(uid, "Заказы на сегодня:", reply_markup=kb)
+
+@bot.message_handler(func=lambda msg: msg.text == "📥 Приёмки сегодня")
+def handle_today_deliveries(m):
+    uid = m.chat.id
+    date_s = today_str()
+    rows = get_tasks_by_date(uid, date_s)
+    deliveries = [r for r in rows if "принять поставку" in (r.get("Задача","") or "").lower()]
+    if not deliveries:
+        bot.send_message(uid, "На сегодня приёмок нет.", reply_markup=supply_menu()); return
+    items = []
+    for i,r in enumerate(deliveries, start=1):
+        tid = sha_task_id(str(r.get("User ID")), r.get("Дата",""), r.get("Категория",""), r.get("Подкатегория",""), r.get("Задача",""), r.get("Дедлайн",""))
+        items.append((build_task_line(r, i), tid))
+    kb = types.InlineKeyboardMarkup()
+    for text, tid in items:
+        kb.add(types.InlineKeyboardButton(text, callback_data=mk_cb("open", id=tid)))
+    bot.send_message(uid, "Приёмки на сегодня:", reply_markup=kb)
+
+@bot.message_handler(func=lambda msg: msg.text == "🆕 Добавить поставщика")
+def handle_add_supplier(m):
+    uid = m.chat.id
+    set_state(uid, "add_supplier")
+    bot.send_message(uid, "Формат: <b>Поставщик; Правило; ДедлайнЗаказа; Emoji; DeliveryOffsetDays; Хранение_дней; Старт_цикла; Авто(1/0); Активен(1/0)</b>\n\nНапр.: \nК-Экспро; каждые 2 дня; 14:00; 📦; 1; 0; ; 1; 1")
 
 @bot.message_handler(func=lambda msg: msg.text == "🧠 Ассистент")
 def handle_ai(m):
     uid = m.chat.id
-    bot.send_message(uid, "Что нужно? (спланировать день, выделить приоритеты, составить расписание и т.д.)")
-    bot.register_next_step_handler(m, assistant_text)
-
-def assistant_text(m):
-    uid = m.chat.id
-    answer = ai_assist_answer(m.text.strip(), uid)
-    bot.send_message(uid, f"🧠 {answer}", reply_markup=main_menu())
-
-@bot.message_handler(func=lambda msg: msg.text == "📊 Отчёт")
-def handle_report(m):
-    uid = m.chat.id
-    start = now_local().date()
-    rows = get_all_rows()
-    expanded = expand_rows_for_range(rows, start - timedelta(days=7), 14, str(uid))
-    total = len(expanded)
-    done = sum(1 for _,r in expanded if (r.get("Статус","").lower()=="выполнено"))
-    bot.send_message(uid, f"За последние 2 недели:\nВсего: {total}\nВыполнено: {done}\nОткрыто: {total-done}")
+    set_state(uid, "assistant_text")
+    bot.send_message(uid, "Что нужно? (спланировать день, выделить приоритеты, составить график закупок и т.д.)")
 
 @bot.message_handler(func=lambda msg: msg.text == "⚙️ Настройки")
 def handle_settings(m):
     bot.send_message(m.chat.id, f"Часовой пояс: <b>{TZ_NAME}</b>\nУтренний дайджест: <b>08:00</b>", reply_markup=main_menu())
 
-# ===================== CALLBACKS: открыть/выполнить/подзадачи/пагинация =====================
-def find_row_by_tid(tid) -> Tuple[str, Dict] | None:
-    rows = get_all_rows()
-    for cat, r in rows:
-        if sha_task_id({"Категория":cat, **r}) == tid:
-            return cat, r
-    return None
+@bot.message_handler(func=lambda msg: msg.text in ["⬅ Назад","⬅ Отмена"])
+def handle_back(m):
+    clear_state(m.chat.id)
+    bot.send_message(m.chat.id, "Главное меню:", reply_markup=main_menu())
 
-def render_task_card(cat, r):
-    date_s = r.get("Дата") or "—"
-    header = (f"<b>{r.get('Задача','')}</b>\n"
-              f"📅 {date_s if date_s=='—' else (weekday_ru(datetime.strptime(date_s,'%d.%m.%Y'))+' — '+date_s)}\n"
-              f"📁 {r.get('Категория','—')} / {r.get('Подкатегория','—')}\n"
-              f"⏰ Дедлайн: {r.get('Дедлайн') or '—'}\n"
-              f"📝 Статус: {r.get('Статус') or '—'}\n"
-              f"🔁 Повторяемость: {r.get('Повторяемость') or '—'}")
-    kb = types.InlineKeyboardMarkup()
-    kb.add(types.InlineKeyboardButton("✅ Выполнить", callback_data=mk_cb("done", id=sha_task_id({"Категория":cat, **r}))))
-    if is_order_task(r.get("Задача","")):
-        kb.add(types.InlineKeyboardButton("🚚 Принять поставку", callback_data=mk_cb("accept_delivery", id=sha_task_id({"Категория":cat, **r}))))
-    kb.add(types.InlineKeyboardButton("➕ Подзадача", callback_data=mk_cb("add_sub", id=sha_task_id({"Категория":cat, **r}))))
-    kb.add(types.InlineKeyboardButton("⏰ Напоминание", callback_data=mk_cb("remind_set", id=sha_task_id({"Категория":cat, **r}))))
-    kb.add(types.InlineKeyboardButton("❌ Закрыть", callback_data=mk_cb("close_card")))
-    return header, kb
+# ===================== ТЕКСТОВЫЕ СОСТОЯНИЯ =====================
+@bot.message_handler(func=lambda msg: get_state(msg.chat.id) == "adding_text")
+def adding_text(m):
+    uid = m.chat.id
+    txt = m.text.strip()
+    try:
+        items = ai_parse_to_tasks(txt, uid)
+        created = 0
+        for it in items:
+            cat  = it["category"] or "Личное"
+            ws = get_ws_by_category(cat)
+            if not ws:
+                bot.send_message(uid, f"Не найден лист категории «{cat}». Задача пропущена.", reply_markup=main_menu())
+                continue
+            date_s = it["date"] or today_str()
+            sub    = it["subcategory"] or ""
+            task   = it["task"]
+            tm     = it["time"] or ""
+            repeat = it["repeat"] or ""
+            source = it["supplier"] or ""
+            add_task_smart(cat, date_s, sub, task, tm, uid, repeat=repeat, source=source)
+            created += 1
+        bot.send_message(uid, f"✅ Добавлено задач: {created}", reply_markup=main_menu())
+        log_event(uid, "add_task_nlp", txt)
+    except Exception as e:
+        log.error(f"adding_text error: {e}")
+        bot.send_message(uid, "Не смог добавить. Попробуй иначе.", reply_markup=main_menu())
+    finally:
+        clear_state(uid)
 
+@bot.message_handler(func=lambda msg: get_state(msg.chat.id) == "search_text")
+def search_text(m):
+    uid = m.chat.id
+    q = m.text.strip().lower()
+    found = []
+    for cat, ws in SHEETS.items():
+        if not ws: continue
+        rows = ws.get_all_records()
+        for r in rows:
+            if str(r.get("User ID")) != str(uid): 
+                continue
+            hay = " ".join([str(r.get(k,"")) for k in TASK_HEADERS]).lower()
+            if q in hay:
+                tid = sha_task_id(str(r.get("User ID")), r.get("Дата",""), r.get("Категория",cat), r.get("Подкатегория",""), r.get("Задача",""), r.get("Дедлайн",""))
+                found.append((build_task_line(r), tid))
+    if not found:
+        bot.send_message(uid, "Ничего не найдено.", reply_markup=main_menu()); clear_state(uid); return
+    total_pages = (len(found)+PAGE_SIZE-1)//PAGE_SIZE
+    page = 1
+    slice_items = found[(page-1)*PAGE_SIZE:page*PAGE_SIZE]
+    kb = page_buttons(slice_items, page, total_pages, prefix_action="open")
+    bot.send_message(uid, "Найденные задачи:", reply_markup=kb)
+    clear_state(uid)
+
+@bot.message_handler(func=lambda msg: get_state(msg.chat.id) == "done_text")
+def done_text(m):
+    uid = m.chat.id
+    txt = m.text.strip().lower()
+    supplier = guess_supplier(txt)
+    # Закрываем сегодняшние подходящие задачи
+    changed = 0
+    last_closed = None
+    rows = get_tasks_by_date(uid, today_str())
+    for r in rows:
+        if (r.get("Статус","") or "").lower() == "выполнено":
+            continue
+        t = (r.get("Задача","") or "").lower()
+        if supplier and supplier.lower() not in t:
+            continue
+        if not supplier and not any(w in t for w in ["к-экспро","вылегжан","заказ","сделал","оформил"]):
+            continue
+        tid = sha_task_id(str(r.get("User ID")), r.get("Дата",""), r.get("Категория",""), r.get("Подкатегория",""), r.get("Задача",""), r.get("Дедлайн",""))
+        ok, _r = mark_done_by_id(tid, uid)
+        if ok:
+            changed += 1
+            last_closed = _r
+    msg = f"✅ Отмечено выполненным: {changed}."
+    if changed and last_closed and supplier:
+        created = plan_next_by_supplier_rule(uid, supplier, last_closed.get("Категория","Кофейня"), last_closed.get("Подкатегория",""), last_closed.get("Задача",""))
+        if created:
+            msg += "\n🔮 Запланировано: " + ", ".join([f"приёмка {d1.strftime('%d.%m')} → заказ {d2.strftime('%d.%m')}" for d1,d2 in created])
+    bot.send_message(uid, msg, reply_markup=main_menu())
+    clear_state(uid)
+
+@bot.message_handler(func=lambda msg: get_state(msg.chat.id) == "assistant_text")
+def assistant_text(m):
+    uid = m.chat.id
+    answer = ai_assist_answer(m.text.strip(), uid)
+    bot.send_message(uid, f"🧠 {answer}", reply_markup=main_menu())
+    clear_state(uid)
+
+@bot.message_handler(func=lambda msg: get_state(msg.chat.id) == "add_supplier")
+def add_supplier_text(m):
+    uid = m.chat.id
+    txt = m.text.strip()
+    if not ws_suppliers:
+        bot.send_message(uid, "Лист 'Поставщики' недоступен.", reply_markup=supply_menu()); clear_state(uid); return
+    try:
+        # Поставщик; Правило; ДедлайнЗаказа; Emoji; DeliveryOffsetDays; Хранение_дней; Старт_цикла; Авто; Активен
+        parts = [p.strip() for p in txt.split(";")]
+        while len(parts) < 9:
+            parts.append("")
+        ws_suppliers.append_row(parts[:9], value_input_option="USER_ENTERED")
+        load_supplier_rules_from_sheet()
+        bot.send_message(uid, f"✅ Поставщик «{parts[0]}» добавлен.", reply_markup=supply_menu())
+    except Exception as e:
+        log.error(f"add_supplier error: {e}")
+        bot.send_message(uid, "Не получилось добавить поставщика.", reply_markup=supply_menu())
+    finally:
+        clear_state(uid)
+
+# ====== МАСТЕР ДОБАВЛЕНИЯ (категория → подкатегория → текст → дата → время → повтор) ======
+@bot.message_handler(func=lambda msg: get_state(msg.chat.id) == "wizard_cat")
+def wizard_cat(m):
+    uid = m.chat.id
+    cat = (m.text or "").strip()
+    if cat not in CATEGORIES:
+        bot.send_message(uid, "Выбери категорию кнопкой.", reply_markup=types.ReplyKeyboardMarkup(resize_keyboard=True).add(*[types.KeyboardButton(c) for c in CATEGORIES])); return
+    set_state(uid, "wizard_sub", {"cat":cat})
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row("Центр","Полет","—")
+    kb.row("⬅ Отмена")
+    bot.send_message(uid, "Выбери подкатегорию (или «—»):", reply_markup=kb)
+
+@bot.message_handler(func=lambda msg: get_state(msg.chat.id) == "wizard_sub")
+def wizard_sub(m):
+    uid = m.chat.id
+    data = get_data(uid)
+    sub = (m.text or "").strip()
+    if sub == "—": sub = ""
+    set_state(uid, "wizard_task", {"cat":data["cat"], "sub":sub})
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row("⬅ Отмена")
+    bot.send_message(uid, "Введи название задачи:", reply_markup=kb)
+
+@bot.message_handler(func=lambda msg: get_state(msg.chat.id) == "wizard_task")
+def wizard_task(m):
+    uid = m.chat.id
+    data = get_data(uid)
+    task = m.text.strip()
+    set_state(uid, "wizard_date", {"cat":data["cat"], "sub":data["sub"], "task":task})
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row("Сегодня","Завтра")
+    kb.row("📅 Другая дата","⬅ Отмена")
+    bot.send_message(uid, "Выбери дату:", reply_markup=kb)
+
+@bot.message_handler(func=lambda msg: get_state(msg.chat.id) == "wizard_date")
+def wizard_date(m):
+    uid = m.chat.id
+    data = get_data(uid)
+    t = m.text.strip().lower()
+    if t == "сегодня": ds = today_str()
+    elif t == "завтра": ds = today_str(now_local()+timedelta(days=1))
+    elif t in ["📅 другая дата","другая дата"]:
+        set_state(uid, "wizard_date_manual", data)
+        bot.send_message(uid, "Введи дату ДД.ММ.ГГГГ:")
+        return
+    else:
+        bot.send_message(uid, "Выбери дату кнопкой или «📅 Другая дата»."); return
+    set_state(uid, "wizard_time", {**data, "date": ds})
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row("09:00","12:00","14:00","16:00","—")
+    kb.row("⬅ Отмена")
+    bot.send_message(uid, "Выбери дедлайн (или «—»):", reply_markup=kb)
+
+@bot.message_handler(func=lambda msg: get_state(msg.chat.id) == "wizard_date_manual")
+def wizard_date_manual(m):
+    uid = m.chat.id
+    data = get_data(uid)
+    ds = m.text.strip()
+    try:
+        datetime.strptime(ds, "%d.%m.%Y")
+    except Exception:
+        bot.send_message(uid, "Неверный формат. Нужен ДД.ММ.ГГГГ."); return
+    set_state(uid, "wizard_time", {**data, "date": ds})
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row("09:00","12:00","14:00","16:00","—")
+    kb.row("⬅ Отмена")
+    bot.send_message(uid, "Выбери дедлайн (или «—»):", reply_markup=kb)
+
+@bot.message_handler(func=lambda msg: get_state(msg.chat.id) == "wizard_time")
+def wizard_time(m):
+    uid = m.chat.id
+    data = get_data(uid)
+    t = m.text.strip()
+    if t == "—":
+        tm = ""
+    else:
+        if not re.fullmatch(r"\d{1,2}:\d{2}", t):
+            bot.send_message(uid, "Формат ЧЧ:ММ или «—»."); return
+        tm = t
+    set_state(uid, "wizard_repeat", {**data, "time": tm})
+    kb = types.ReplyKeyboardMarkup(resize_keyboard=True)
+    kb.row("—","каждый день","каждые 2 дня","каждую неделю")
+    kb.row("⬅ Отмена")
+    bot.send_message(uid, "Повторяемость:", reply_markup=kb)
+
+@bot.message_handler(func=lambda msg: get_state(msg.chat.id) == "wizard_repeat")
+def wizard_repeat(m):
+    uid = m.chat.id
+    data = get_data(uid)
+    rep = m.text.strip()
+    if rep == "—": rep = ""
+    # записываем
+    try:
+        add_task_smart(data["cat"], data["date"], data["sub"], data["task"], data["time"], uid, repeat=rep)
+        bot.send_message(uid, "✅ Задача добавлена.", reply_markup=main_menu())
+        log_event(uid, "add_task_wizard", json.dumps(data, ensure_ascii=False))
+    except Exception as e:
+        log.error(f"wizard add error: {e}")
+        bot.send_message(uid, "Не удалось добавить задачу (проверь, что лист категории существует).", reply_markup=main_menu())
+    finally:
+        clear_state(uid)
+
+# ===================== INLINE CALLBACKS =====================
 @bot.callback_query_handler(func=lambda c: True)
 def callbacks(c):
     uid = c.message.chat.id
-    data = parse_cb(c.data) if c.data and c.data!="noop" else None
-    if not data: 
+    data = parse_cb(c.data) if c.data and c.data != "noop" else None
+    if not data:
         bot.answer_callback_query(c.id); return
+
     a = data.get("a")
 
     if a == "page":
-        # В этом релизе пагинация ограниченно обновляется (перерисовывать текущий список не будем)
+        # Для простоты обновим список «Сегодня»
+        date_s = today_str()
+        rows = get_tasks_by_date(uid, date_s)
+        items = []
+        for r in rows:
+            tid = sha_task_id(str(r.get("User ID")), r.get("Дата",""), r.get("Категория",""), r.get("Подкатегория",""), r.get("Задача",""), r.get("Дедлайн",""))
+            items.append((build_task_line(r), tid))
+        total_pages = (len(items)+PAGE_SIZE-1)//PAGE_SIZE
+        page = max(1, min(int(data.get("p", 1)), total_pages))
+        slice_items = items[(page-1)*PAGE_SIZE:page*PAGE_SIZE]
+        kb = page_buttons(slice_items, page, total_pages, prefix_action="open")
+        try:
+            bot.edit_message_reply_markup(uid, c.message.message_id, reply_markup=kb)
+        except Exception:
+            pass
         bot.answer_callback_query(c.id); return
 
     if a == "open":
-        tid = data.get("id")
-        found = find_row_by_tid(tid)
+        task_id = data.get("id")
+        text, kb = render_task_card(uid, task_id)
         bot.answer_callback_query(c.id)
-        if not found:
-            bot.send_message(uid,"Задача не найдена."); return
-        cat, r = found
-        text, kb = render_task_card(cat, r)
-        bot.send_message(uid, text, reply_markup=kb)
+        if kb: bot.send_message(uid, text, reply_markup=kb)
+        else:  bot.send_message(uid, text)
         return
 
     if a == "close_card":
         bot.answer_callback_query(c.id, "Закрыто")
-        try: bot.delete_message(uid, c.message.message_id)
-        except Exception: pass
+        try:
+            bot.delete_message(uid, c.message.message_id)
+        except Exception:
+            pass
         return
 
     if a == "done":
-        tid = data.get("id")
-        found = find_row_by_tid(tid)
-        if not found:
-            bot.answer_callback_query(c.id,"Не нашёл", show_alert=True); return
-        cat, r = found
-        ok = update_cell_by_match(cat, r, "Статус", "выполнено")
+        task_id = data.get("id")
+        ok, r = mark_done_by_id(task_id, uid)
         if not ok:
-            bot.answer_callback_query(c.id,"Не смог обновить", show_alert=True); return
-        msg = "✅ Готово."
+            bot.answer_callback_query(c.id, "Не смог отметить", show_alert=True); return
         supplier = guess_supplier(r.get("Задача",""))
+        msg = "✅ Готово."
         if supplier:
-            # автопланирование (простой сценарий: приемка завтра, новый заказ через 2-3 дня по поставщику)
-            ds = parse_ru_date(r.get("Дата")) or now_local().date()
-            accept_day = (ds + timedelta(days=1)).strftime("%d.%m.%Y")
-            add_row = [accept_day, cat, r.get("Подкатегория",""),
-                       f"🚚 Принять поставку {supplier} ({normalize_tt_from_subcat(r.get('Подкатегория','')) or '—'})",
-                       "10:00", str(uid), "", "", f"auto:delivery:{supplier}"]
-            append_to_sheet(cat, add_row)
-            msg += " Запланирована приемка."
+            created = plan_next_by_supplier_rule(uid, supplier, r.get("Категория","Кофейня"), r.get("Подкатегория",""), r.get("Задача",""))
+            if created: msg += " Запланирована приёмка/следующий заказ."
         bot.answer_callback_query(c.id, msg, show_alert=True)
+        # перерисуем карточку
+        text, kb = render_task_card(uid, task_id)
+        if kb: bot.edit_message_text(text, uid, c.message.message_id, reply_markup=kb)
+        else:  bot.edit_message_text(text, uid, c.message.message_id)
         return
 
     if a == "accept_delivery":
-        tid = data.get("id")
-        found = find_row_by_tid(tid)
-        if not found:
-            bot.answer_callback_query(c.id,"Не нашёл", show_alert=True); return
-        cat, r = found
+        task_id = data.get("id")
         kb = types.InlineKeyboardMarkup()
         kb.row(
-            types.InlineKeyboardButton("Сегодня", callback_data=mk_cb("accept_delivery_date", id=tid, d="today")),
-            types.InlineKeyboardButton("Завтра", callback_data=mk_cb("accept_delivery_date", id=tid, d="tomorrow")),
+            types.InlineKeyboardButton("Сегодня", callback_data=mk_cb("accept_delivery_date", id=task_id, d="today")),
+            types.InlineKeyboardButton("Завтра", callback_data=mk_cb("accept_delivery_date", id=task_id, d="tomorrow")),
         )
-        kb.row(types.InlineKeyboardButton("📅 Другая дата", callback_data=mk_cb("accept_delivery_pick", id=tid)))
+        kb.row(types.InlineKeyboardButton("📅 Другая дата", callback_data=mk_cb("accept_delivery_pick", id=task_id)))
         bot.answer_callback_query(c.id)
         bot.send_message(uid, "Когда принять поставку?", reply_markup=kb)
         return
 
     if a == "accept_delivery_pick":
-        set_state(uid, "pick_delivery_date", {"task_id": data.get("id")})
+        task_id = data.get("id")
+        set_state(uid, "pick_delivery_date", {"task_id": task_id})
         bot.answer_callback_query(c.id)
-        bot.send_message(uid, "Введи дату в формате ДД.ММ.ГГГГ:")
+        bot.send_message(uid, "Введи дату ДД.ММ.ГГГГ:")
         return
 
     if a == "accept_delivery_date":
-        tid = data.get("id"); when = data.get("d")
-        found = find_row_by_tid(tid)
-        if not found:
-            bot.answer_callback_query(c.id,"Не нашёл", show_alert=True); return
-        cat, r = found
-        ds = today_str() if when=="today" else today_str(now_local()+timedelta(days=1))
-        supplier = guess_supplier(r.get("Задача","")) or "Поставка"
-        append_to_sheet(cat, [ds, cat, r.get("Подкатегория",""),
-                              f"🚚 Принять поставку {supplier} ({normalize_tt_from_subcat(r.get('Подкатегория','')) or '—'})",
-                              "10:00", str(uid), "", "", f"subtask:{tid}"])
-        bot.answer_callback_query(c.id, f"Создана задача на {ds}", show_alert=True)
+        task_id = data.get("id")
+        when = data.get("d")
+        # найдём исходную задачу
+        base = None; base_ws = None; base_idx = None
+        for cat, ws in SHEETS.items():
+            if not ws: continue
+            rows = ws.get_all_records()
+            idx = find_row_index_by_id(ws, task_id, rows)
+            if idx:
+                base = rows[idx-2]; base_ws = ws; base_idx = idx; break
+        if not base:
+            bot.answer_callback_query(c.id, "Задача не найдена", show_alert=True); return
+        if when == "today": date_s = today_str()
+        elif when == "tomorrow": date_s = today_str(now_local()+timedelta(days=1))
+        else: date_s = today_str()
+        supplier = guess_supplier(base.get("Задача","")) or "Поставка"
+        cat = base.get("Категория") or "Кофейня"
+        sub = normalize_tt_from_subcat(base.get("Подкатегория",""))
+        add_task_smart(cat, date_s, sub, f"🚚 Принять поставку {supplier} ({sub or '—'})", "10:00", uid, repeat="", source=f"subtask:{task_id}")
+        bot.answer_callback_query(c.id, f"Создана задача на {date_s}", show_alert=True)
         return
 
     if a == "add_sub":
-        set_state(uid, "add_subtask_text", {"task_id": data.get("id")})
+        task_id = data.get("id")
+        set_state(uid, "add_subtask_text", {"task_id": task_id})
         bot.answer_callback_query(c.id)
         bot.send_message(uid, "Введи текст подзадачи:")
         return
 
     if a == "remind_set":
-        set_state(uid, "set_reminder", {"task_id": data.get("id")})
+        task_id = data.get("id")
+        set_state(uid, "set_reminder", {"task_id": task_id})
         bot.answer_callback_query(c.id)
-        bot.send_message(uid, "Когда напомнить? ЧЧ:ММ (сегодня, локальное время).")
+        bot.send_message(uid, "Когда напомнить? Формат ЧЧ:ММ (локальное время).")
         return
 
-# ======= Текстовые состояния для подзадач/дат/напоминаний =======
-USER_STATE: Dict[int,str] = {}
-USER_DATA: Dict[int,Dict] = {}
-def set_state(uid, state, data=None):
-    USER_STATE[uid] = state
-    if data is not None: USER_DATA[uid] = data
-def get_state(uid): return USER_STATE.get(uid)
-def get_data(uid): return USER_DATA.get(uid, {})
-def clear_state(uid): USER_STATE.pop(uid, None); USER_DATA.pop(uid, None)
-
+# ====== ТЕКСТ ДЛЯ ПОДЗАДАЧ/ДАТЫ/НАПОМИНАНИЙ ======
 @bot.message_handler(func=lambda msg: get_state(msg.chat.id) == "add_subtask_text")
 def add_subtask_text(m):
     uid = m.chat.id
-    data = get_data(uid); tid = data.get("task_id")
-    found = find_row_by_tid(tid)
-    if not found:
-        bot.send_message(uid,"Родительская задача не найдена."); clear_state(uid); return
-    cat, parent = found
-    append_to_sheet(cat, [parent.get("Дата",""), cat, parent.get("Подкатегория",""),
-                          f"• {m.text.strip()}", parent.get("Дедлайн",""), str(uid), "", "", f"subtask:{tid}"])
-    bot.send_message(uid,"Подзадача добавлена.", reply_markup=main_menu()); clear_state(uid)
+    data = get_data(uid)
+    task_id = data.get("task_id")
+    text = m.text.strip()
+    # найдём родителя
+    base = None
+    for cat, ws in SHEETS.items():
+        if not ws: continue
+        rows = ws.get_all_records()
+        idx = find_row_index_by_id(ws, task_id, rows)
+        if idx:
+            base = (cat, rows[idx-2]); break
+    if not base:
+        bot.send_message(uid, "Родительская задача не найдена.", reply_markup=main_menu()); clear_state(uid); return
+    cat, parent = base
+    add_task_smart(cat, parent.get("Дата",""), parent.get("Подкатегория",""), f"• {text}", parent.get("Дедлайн",""), uid, repeat="", source=f"subtask:{task_id}")
+    bot.send_message(uid, "Подзадача добавлена.", reply_markup=main_menu())
+    clear_state(uid)
 
 @bot.message_handler(func=lambda msg: get_state(msg.chat.id) == "pick_delivery_date")
 def pick_delivery_date(m):
     uid = m.chat.id
-    data = get_data(uid); tid = data.get("task_id")
+    data = get_data(uid)
+    task_id = data.get("task_id")
     ds = m.text.strip()
-    try: datetime.strptime(ds, "%d.%m.%Y")
-    except: bot.send_message(uid,"Дата некорректна."); clear_state(uid); return
-    found = find_row_by_tid(tid)
-    if not found: bot.send_message(uid,"Задача не найдена."); clear_state(uid); return
-    cat, r = found
+    try:
+        datetime.strptime(ds, "%d.%m.%Y")
+    except Exception:
+        bot.send_message(uid, "Дата некорректна. Нужен ДД.ММ.ГГГГ.", reply_markup=main_menu()); clear_state(uid); return
+    base = None
+    for cat, ws in SHEETS.items():
+        if not ws: continue
+        rows = ws.get_all_records()
+        idx = find_row_index_by_id(ws, task_id, rows)
+        if idx:
+            base = (cat, rows[idx-2]); break
+    if not base:
+        bot.send_message(uid, "Задача не найдена.", reply_markup=main_menu()); clear_state(uid); return
+    cat, r = base
     supplier = guess_supplier(r.get("Задача","")) or "Поставка"
-    append_to_sheet(cat, [ds, cat, r.get("Подкатегория",""),
-                          f"🚚 Принять поставку {supplier} ({normalize_tt_from_subcat(r.get('Подкатегория','')) or '—'})",
-                          "10:00", str(uid), "", "", f"subtask:{tid}"])
-    bot.send_message(uid, f"Создана задача на {ds}.", reply_markup=main_menu()); clear_state(uid)
+    sub = normalize_tt_from_subcat(r.get("Подкатегория",""))
+    add_task_smart(cat, ds, sub, f"🚚 Принять поставку {supplier} ({sub or '—'})", "10:00", uid, repeat="", source=f"subtask:{task_id}")
+    bot.send_message(uid, f"Создана задача на {ds}.", reply_markup=main_menu())
+    clear_state(uid)
 
 @bot.message_handler(func=lambda msg: get_state(msg.chat.id) == "set_reminder")
 def set_reminder(m):
     uid = m.chat.id
-    data = get_data(uid); tid = data.get("task_id")
+    data = get_data(uid)
+    task_id = data.get("task_id")
     t = m.text.strip()
     if not re.fullmatch(r"\d{1,2}:\d{2}", t):
         bot.send_message(uid, "Нужен формат ЧЧ:ММ.", reply_markup=main_menu()); clear_state(uid); return
-    found = find_row_by_tid(tid)
-    if not found: bot.send_message(uid,"Задача не найдена."); clear_state(uid); return
-    cat, r = found
-    cur_source = r.get("Источник","") or ""
-    new_source = (cur_source + "; " if cur_source else "") + f"remind:{t}"
-    update_cell_by_match(cat, r, "Источник", new_source)
-    bot.send_message(uid, f"Напоминание установлено на {t}.", reply_markup=main_menu()); clear_state(uid)
+    # найдём запись и допишем в «Источник» маркер remind:HH:MM
+    for cat, ws in SHEETS.items():
+        if not ws: continue
+        rows = ws.get_all_records()
+        idx = find_row_index_by_id(ws, task_id, rows)
+        if not idx: 
+            continue
+        cur_source = rows[idx-2].get("Источник","") or ""
+        new_source = (cur_source + "; " if cur_source else "") + f"remind:{t}"
+        update_cell(ws, idx, "Источник", new_source)
+        bot.send_message(uid, f"Напоминание установлено на {t}.", reply_markup=main_menu())
+        clear_state(uid)
+        return
+    bot.send_message(uid, "Не нашёл задачу.", reply_markup=main_menu()); clear_state(uid)
 
 # ===================== ДАЙДЖЕСТ/НАПОМИНАНИЯ =====================
-NOTIFIED = set()
-
 def job_daily_digest():
     try:
+        if not ws_users: return
         users = ws_users.get_all_records()
         today = today_str()
         for u in users:
             uid = str(u.get("Telegram ID") or "").strip()
-            if not uid: continue
-            start = now_local().date()
-            rows = get_all_rows()
-            expanded = expand_rows_for_range(rows, start, 1, uid)
-            tasks = [r for _, r in expanded if r["Дата"] == today]
-            if not tasks: continue
+            if not uid:
+                continue
+            tasks = get_tasks_by_date(uid, today)
+            if not tasks:
+                continue
             text = f"📅 План на {today}\n\n" + format_grouped(tasks, header_date=today)
-            try: bot.send_message(uid, text)
-            except Exception as e: log.error("send digest error %s", e)
+            try:
+                bot.send_message(uid, text)
+            except Exception as e:
+                log.error(f"send digest error {e}")
     except Exception as e:
-        log.error("job_daily_digest error %s", e)
+        log.error(f"job_daily_digest error {e}")
 
 def job_reminders():
     try:
         today = today_str()
-        rows = get_all_rows()
-        for cat, r in rows:
-            if r.get("Дата") != today: continue
+        rows = get_all_task_rows()
+        for r in rows:
+            if (r.get("Дата") or "") != today: 
+                continue
             src = (r.get("Источник") or "")
-            if "remind:" not in src: continue
+            if "remind:" not in src:
+                continue
             matches = re.findall(r"remind:(\d{1,2}:\d{2})", src)
             for tm in matches:
-                key = sha_task_id({"Категория":cat, **r}) + "|" + today + "|" + tm
-                if key in NOTIFIED: continue
-                try:
-                    hh, mm = map(int, tm.split(":"))
-                    nowt = now_local().time()
-                    if (nowt.hour, nowt.minute) >= (hh, mm):
+                key = sha_task_id(str(r.get("User ID")), r.get("Дата",""), r.get("Категория",""), r.get("Подкатегория",""), r.get("Задача",""), r.get("Дедлайн","")) + "|" + today + "|" + tm
+                if key in NOTIFIED:
+                    continue
+                hh, mm = map(int, tm.split(":"))
+                nowt = now_local().time()
+                if (nowt.hour, nowt.minute) >= (hh, mm):
+                    try:
                         bot.send_message(r.get("User ID"), f"⏰ Напоминание: {r.get('Категория','')}/{r.get('Подкатегория','')} — {r.get('Задача','')} (до {r.get('Дедлайн') or '—'})")
                         NOTIFIED.add(key)
-                except Exception: pass
+                    except Exception:
+                        pass
     except Exception as e:
-        log.error("job_reminders error %s", e)
+        log.error(f"job_reminders error {e}")
 
 def scheduler_thread():
     schedule.clear()
     schedule.every().day.at("08:00").do(job_daily_digest)
     schedule.every(1).minutes.do(job_reminders)
     while True:
-        schedule.run_pending(); time.sleep(1)
+        schedule.run_pending()
+        time.sleep(1)
 
-# ===================== WEBHOOK / RUN =====================
+# ===================== WEBHOOK / FLASK =====================
 app = Flask(__name__)
 
 @app.route("/" + API_TOKEN, methods=["POST"])
@@ -904,19 +1114,22 @@ def webhook():
         upd = types.Update.de_json(update)
         bot.process_new_updates([upd])
     except Exception as e:
-        log.error("Webhook error: %s", e)
+        log.error(f"Webhook error: {e}")
     return "OK", 200
 
 @app.route("/")
 def home():
     return "Bot is running!"
 
+# ===================== START =====================
 if __name__ == "__main__":
     if not API_TOKEN or not WEBHOOK_URL:
         raise RuntimeError("Не заданы TELEGRAM_TOKEN или WEBHOOK_BASE")
 
-    try: bot.remove_webhook()
-    except Exception: pass
+    try:
+        bot.remove_webhook()
+    except Exception:
+        pass
     time.sleep(0.5)
     bot.set_webhook(url=WEBHOOK_URL)
 
