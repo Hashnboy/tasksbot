@@ -1100,14 +1100,11 @@ def scheduler_loop():
 # ========= FLASK/WEBHOOK =========
 app = Flask(__name__)
 
-@app.route("/" + API_TOKEN, methods=["POST"])
+@app.route("/" + os.getenv("WEBHOOK_SECRET"), methods=["POST"])
 def webhook():
-    try:
-        upd_json = request.get_data().decode("utf-8")
-        update   = types.Update.de_json(upd_json)
-        bot.process_new_updates([update])
-    except Exception as e:
-        log.error("webhook error: %s", e)
+    data = request.get_data().decode("utf-8")
+    upd = types.Update.de_json(data)
+    bot.process_new_updates([upd])
     return "OK", 200
 
 @app.route("/")
