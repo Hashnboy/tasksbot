@@ -2,18 +2,10 @@
 """
 TasksBot — Telegram-бот с PostgreSQL, webhook, GPT-помощником и автоматизацией закупок/поставок.
 
-Ключевые фичи:
-- PostgreSQL (SQLAlchemy ORM)
-- Вебхук (Flask) — НИКАКОГО polling -> нет 409
-- Задачи/подзадачи/поставщики/повторяемость
-- Кнопки: меню по темам, пагинация, карточка задачи (done/приёмка/подзадача/дедлайн/напоминание/удаление)
-- Автопланирование поставок (К-Экспро, ИП Вылегжанина и любые из листа поставщиков)
-- Умный парсинг через GPT (если задан OPENAI_API_KEY) + фоллбек-эвристики
-- Ежедневный дайджест в 08:00 (по TZ) + минута-в-минуту напоминания
-
 ENV:
   TELEGRAM_TOKEN     — токен бота
   WEBHOOK_BASE       — базовый URL твоего сервера, напр. https://your-app.vkcloud.ru
+  WEBHOOK_SECRET     — секретный хвост вебхука (путь), напр. my_webhook_secret_x7k98
   DATABASE_URL       — строка подключения к PostgreSQL, напр. postgresql+psycopg2://user:pass@host:5432/db
   OPENAI_API_KEY     — ключ OpenAI (опционально, для NLP/ассистента)
   TZ                 — таймзона, напр. Europe/Moscow (по умолчанию)
@@ -26,7 +18,6 @@ import hmac
 import json
 import pytz
 import time
-import math
 import uuid
 import hashlib
 import logging
@@ -55,16 +46,17 @@ else:
     openai_client = None
 
 # ========= НАСТРОЙКИ ОКРУЖЕНИЯ =========
-API_TOKEN   = os.getenv("TELEGRAM_TOKEN")
-WEBHOOK_BASE= os.getenv("WEBHOOK_BASE")
-DB_URL      = os.getenv("DATABASE_URL")
-TZ_NAME     = os.getenv("TZ", "Europe/Moscow")
-PORT        = int(os.getenv("PORT", "10000"))
+API_TOKEN      = os.getenv("TELEGRAM_TOKEN")
+WEBHOOK_BASE   = os.getenv("WEBHOOK_BASE")
+WEBHOOK_SECRET = os.getenv("WEBHOOK_SECRET", "my_webhook_secret_x7k98")
+DB_URL         = os.getenv("DATABASE_URL")
+TZ_NAME        = os.getenv("TZ", "Europe/Moscow")
+PORT           = int(os.getenv("PORT", "10000"))
 
 if not API_TOKEN or not WEBHOOK_BASE or not DB_URL:
     raise RuntimeError("Нужны ENV: TELEGRAM_TOKEN, WEBHOOK_BASE, DATABASE_URL")
 
-WEBHOOK_URL = f"{WEBHOOK_BASE}/{API_TOKEN}"
+WEBHOOK_URL = f"{WEBHOOK_BASE}/{WEBHOOK_SECRET}"
 LOCAL_TZ    = pytz.timezone(TZ_NAME)
 
 # ========= ЛОГИ =========
@@ -159,10 +151,6 @@ def weekday_ru(dt):
     names = ["Понедельник","Вторник","Среда","Четверг","Пятница","Суббота","Воскресенье"]
     return names[dt.weekday()]
 
-def sha_task_id(task: Task):
-    key = f"{task.user_id}|{task.date.isoformat()}|{task.category}|{task.subcategory}|{task.text}|{task.deadline or ''}"
-    return hashlib.sha1(key.encode("utf-8")).hexdigest()[:16]
-
 def mk_cb(action, **kwargs):
     payload = {"a": action, **kwargs}
     s = json.dumps(payload, ensure_ascii=False)
@@ -196,12 +184,11 @@ def ai_parse_to_items(text, fallback_uid):
       "category": "...",
       "subcategory": "...",
       "task": "...",
-      "repeat": "",  # человекочитаемое
+      "repeat": "",    # человекочитаемое правило
       "supplier": "",  # распознанный поставщик
       "user_id": fallback_uid
     }
     """
-    # Попытка через OpenAI
     if openai_client:
         try:
             sys = (
@@ -233,7 +220,7 @@ def ai_parse_to_items(text, fallback_uid):
         except Exception as e:
             log.error("AI parse failed: %s", e)
 
-    # Фоллбек-эвристика
+    # фоллбек-эвристика
     txt = text.strip()
     tl  = txt.lower()
     cat = "Кофейня" if any(x in tl for x in ["кофейн","к-экспро","вылегжан"]) else ("Табачка" if "табач" in tl else ("WB" if "wb" in tl else "Личное"))
@@ -256,7 +243,6 @@ def ai_parse_to_items(text, fallback_uid):
     }]
 
 # ========= ПРАВИЛА ПОСТАВЩИКОВ =========
-# Базовые (можно переопределять данными из таблицы suppliers)
 BASE_SUP_RULES = {
     "к-экспро": {
         "kind": "cycle_every_n_days",
@@ -278,10 +264,8 @@ def normalize_supplier_name(name: str) -> str:
     return (name or "").strip().lower()
 
 def load_supplier_rule(sess, supplier_name: str):
-    # 1) из БД
     s = sess.query(Supplier).filter(func.lower(Supplier.name)==normalize_supplier_name(supplier_name)).first()
     if s and s.active:
-        # попытка распознать rule
         rule_l = (s.rule or "").strip().lower()
         if "каждые" in rule_l:
             num = 2
@@ -303,7 +287,6 @@ def load_supplier_rule(sess, supplier_name: str):
                 "deadline": s.order_deadline or "14:00",
                 "emoji": s.emoji or "🥘"
             }
-    # 2) базовая
     base = BASE_SUP_RULES.get(normalize_supplier_name(supplier_name))
     if base:
         return base
@@ -318,61 +301,23 @@ def plan_next_for_supplier(sess, user_id: int, supplier_name: str, category: str
     if rule["kind"] == "cycle_every_n_days":
         delivery_day = today + timedelta(days=rule["delivery_offset"])
         next_order   = today + timedelta(days=rule["n_days"])
-        # Приемка
-        sess.add(Task(
-            user_id=user_id,
-            date=delivery_day,
-            category=category,
-            subcategory=subcategory,
-            text=f"{rule['emoji']} Принять поставку {supplier_name} ({subcategory or '—'})",
-            deadline=parse_time_str("10:00"),
-            status="",
-            repeat_rule="",
-            source=f"auto:delivery:{supplier_name}",
-            is_repeating=False
-        ))
-        # Следующий заказ
-        sess.add(Task(
-            user_id=user_id,
-            date=next_order,
-            category=category,
-            subcategory=subcategory,
-            text=f"{rule['emoji']} Заказать {supplier_name} ({subcategory or '—'})",
-            deadline=parse_time_str(rule["deadline"]),
-            status="",
-            repeat_rule="",
-            source=f"auto:order:{supplier_name}",
-            is_repeating=False
-        ))
+        sess.add(Task(user_id=user_id, date=delivery_day, category=category, subcategory=subcategory,
+                      text=f"{rule['emoji']} Принять поставку {supplier_name} ({subcategory or '—'})",
+                      deadline=parse_time_str("10:00"), source=f"auto:delivery:{supplier_name}"))
+        sess.add(Task(user_id=user_id, date=next_order, category=category, subcategory=subcategory,
+                      text=f"{rule['emoji']} Заказать {supplier_name} ({subcategory or '—'})",
+                      deadline=parse_time_str(rule["deadline"]), source=f"auto:order:{supplier_name}"))
         sess.commit()
         created = [("delivery", delivery_day), ("order", next_order)]
     elif rule["kind"] == "delivery_shelf_then_order":
         delivery_day = today + timedelta(days=rule["delivery_offset"])
         next_order   = delivery_day + timedelta(days=max(1, rule.get("shelf_days", 3)-1))
-        sess.add(Task(
-            user_id=user_id,
-            date=delivery_day,
-            category=category,
-            subcategory=subcategory,
-            text=f"{rule['emoji']} Принять поставку {supplier_name} ({subcategory or '—'})",
-            deadline=parse_time_str("11:00"),
-            status="",
-            repeat_rule="",
-            source=f"auto:delivery:{supplier_name}",
-            is_repeating=False
-        ))
-        sess.add(Task(
-            user_id=user_id,
-            date=next_order,
-            category=category,
-            subcategory=subcategory,
-            text=f"{rule['emoji']} Заказать {supplier_name} ({subcategory or '—'})",
-            deadline=parse_time_str(rule["deadline"]),
-            status="",
-            repeat_rule="",
-            source=f"auto:order:{supplier_name}",
-            is_repeating=False
-        ))
+        sess.add(Task(user_id=user_id, date=delivery_day, category=category, subcategory=subcategory,
+                      text=f"{rule['emoji']} Принять поставку {supplier_name} ({subcategory or '—'})",
+                      deadline=parse_time_str("11:00"), source=f"auto:delivery:{supplier_name}"))
+        sess.add(Task(user_id=user_id, date=next_order, category=category, subcategory=subcategory,
+                      text=f"{rule['emoji']} Заказать {supplier_name} ({subcategory or '—'})",
+                      deadline=parse_time_str(rule["deadline"]), source=f"auto:order:{supplier_name}"))
         sess.commit()
         created = [("delivery", delivery_day), ("order", next_order)]
     return created
@@ -380,16 +325,12 @@ def plan_next_for_supplier(sess, user_id: int, supplier_name: str, category: str
 # ========= ДОСТУП К ДАННЫМ =========
 def add_task(sess, *, user_id:int, date:datetime.date, category:str, subcategory:str, text:str, deadline=None, repeat_rule:str="", source:str="", is_repeating:bool=False):
     t = Task(
-        user_id=user_id,
-        date=date,
+        user_id=user_id, date=date,
         category=category or "Личное",
         subcategory=subcategory or "",
-        text=text.strip(),
-        deadline=deadline,
-        status="",
-        repeat_rule=repeat_rule.strip(),
-        source=source.strip(),
-        is_repeating=is_repeating
+        text=text.strip(), deadline=deadline,
+        status="", repeat_rule=repeat_rule.strip(),
+        source=source.strip(), is_repeating=is_repeating
     )
     sess.add(t)
     sess.commit()
@@ -431,20 +372,11 @@ def create_reminder(sess, task_id:int, user_id:int, date_s:str, time_s:str):
     sess.commit()
     return r
 
-# ========= ПОВТОРЯЮЩИЕСЯ ЗАДАЧИ (по simple правилам) =========
+# ========= ПОВТОРЯЮЩИЕСЯ ЗАДАЧИ =========
 def expand_repeats_for_date(sess, user_id:int, date:datetime.date):
-    """
-    Пример supported правил в Task.repeat_rule:
-      - "каждые 2 дня"
-      - "каждый вторник 12:00"
-      - "по пн,ср"
-    Правило хранится на самой задаче-шаблоне (is_repeating=True), и мы на их основе создаем инстансы на дату.
-    """
-    # найдём шаблоны (is_repeating=True) для этого юзера
     templates = (sess.query(Task)
                  .filter(Task.user_id==user_id, Task.is_repeating==True)
                  .all())
-
     existing = {(t.text, t.category, t.subcategory) for t in get_tasks_for_date(sess, user_id, date)}
 
     weekday_map = ["понедельник","вторник","среда","четверг","пятница","суббота","воскресенье"]
@@ -460,14 +392,12 @@ def expand_repeats_for_date(sess, user_id:int, date:datetime.date):
             m = re.search(r"каждые\s+(\d+)\s+дн", rule)
             if m:
                 n = int(m.group(1))
-                # считаем от стартовой точки (либо created_at, либо 2025-01-01)
                 epoch = tp.created_at.date() if tp.created_at else datetime(2025,1,1).date()
                 if ((date - epoch).days % n) == 0:
                     should = True
 
         elif rule.startswith("каждый "):
-            # "каждый вторник 12:00"
-            for i,wd in enumerate(weekday_map):
+            for wd in weekday_map:
                 if wd in rule and wd == weekday_s:
                     should = True
                     m = re.search(r"(\d{1,2}:\d{2})", rule)
@@ -475,9 +405,7 @@ def expand_repeats_for_date(sess, user_id:int, date:datetime.date):
                     break
 
         elif rule.startswith("по "):
-            # "по пн,ср"
-            short = {"пн":"понедельник","вт":"вторник","ср":"среда",
-                     "чт":"четверг","пт":"пятница","сб":"суббота","вс":"воскресенье"}
+            short = {"пн":"понедельник","вт":"вторник","ср":"среда","чт":"четверг","пт":"пятница","сб":"суббота","вс":"воскресенье"}
             parts = [p.strip() for p in rule.replace("по","").split(",") if p.strip()]
             expanded = [short.get(p, p) for p in parts]
             if weekday_s in expanded:
@@ -501,7 +429,9 @@ def format_grouped(tasks, header_date=None):
         dt = parse_date_str(header_date)
         out.append(f"• {weekday_ru(dt)} — {header_date}\n")
     cur_cat = cur_sub = None
-    for t in sorted(tasks, key=lambda x: (x.category or "", x.subcategory or "", x.deadline or parse_time_str("00:00"), x.text)):
+    def dl_key(t): 
+        return t.deadline if t.deadline is not None else parse_time_str("00:00")
+    for t in sorted(tasks, key=lambda x: (x.category or "", x.subcategory or "", dl_key(x), x.text)):
         icon = "✅" if t.status=="выполнено" else ("🔁" if t.is_repeating else "⬜")
         if t.category != cur_cat:
             out.append(f"📂 <b>{t.category or '—'}</b>"); cur_cat = t.category; cur_sub = None
@@ -570,19 +500,18 @@ def handle_today(m):
     try:
         uid = m.chat.id
         ensure_user(sess, uid)
-        # ДО каждого показа расширяем повторяемость на сегодня
         expand_repeats_for_date(sess, uid, now_local().date())
         rows = get_tasks_for_date(sess, uid, now_local().date())
-        if not rows:
-            bot.send_message(uid, f"📅 Задачи на {dstr(now_local().date())}\n\nЗадач нет.", reply_markup=main_menu()); return
-        # Список + пагинация для открытия карточек
-        items = [(short_task_line(t), t.id) for t in rows]
-        page = 1
-        total = (len(items)+PAGE_SIZE-1)//PAGE_SIZE
-        slice_items = items[(page-1)*PAGE_SIZE:page*PAGE_SIZE]
-        kb = paginate_buttons(slice_items, page, total, "open")
-        header = f"📅 Задачи на {dstr(now_local().date())}\n\n{format_grouped(rows, header_date=dstr(now_local().date()))}\n\nОткрой карточку:"
-        bot.send_message(uid, header, reply_markup=main_menu(), reply_markup_inline=kb)
+        date_label = dstr(now_local().date())
+        header = f"📅 Задачи на {date_label}\n\n{format_grouped(rows, header_date=date_label)}"
+        bot.send_message(uid, header, reply_markup=main_menu())
+        if rows:
+            items = [(short_task_line(t), t.id) for t in rows]
+            page = 1
+            total = (len(items)+PAGE_SIZE-1)//PAGE_SIZE
+            slice_items = items[(page-1)*PAGE_SIZE:page*PAGE_SIZE]
+            kb = paginate_buttons(slice_items, page, total, "open")
+            bot.send_message(uid, "Открой карточку:", reply_markup=kb)
     finally:
         sess.close()
 
@@ -592,13 +521,11 @@ def handle_week(m):
     try:
         uid = m.chat.id
         ensure_user(sess, uid)
-        # расширим шаблоны на 7 дней вперёд
         for i in range(7):
             expand_repeats_for_date(sess, uid, now_local().date()+timedelta(days=i))
         rows = get_tasks_for_week(sess, uid, now_local().date())
         if not rows:
             bot.send_message(uid, "На неделю задач нет.", reply_markup=main_menu()); return
-        # группируем по датам
         by_day = {}
         for t in rows:
             by_day.setdefault(dstr(t.date), []).append(t)
@@ -611,7 +538,6 @@ def handle_week(m):
 
 @bot.message_handler(func=lambda msg: msg.text == "🗓 Вся неделя")
 def handle_all_week(m):
-    # дубль команды выше — оставим как есть для привычки
     handle_week(m)
 
 @bot.message_handler(func=lambda msg: msg.text == "➕ Добавить")
@@ -682,11 +608,11 @@ def adding_text(m):
         for it in items:
             date = parse_date_str(it["date"]) if it["date"] else now_local().date()
             tm   = parse_time_str(it["time"]) if it["time"] else None
-            t = add_task(sess,
-                         user_id=uid, date=date,
-                         category=it["category"], subcategory=it["subcategory"],
-                         text=it["task"], deadline=tm,
-                         repeat_rule=it["repeat"], source=it["supplier"], is_repeating=bool(it["repeat"]))
+            add_task(sess,
+                     user_id=uid, date=date,
+                     category=it["category"], subcategory=it["subcategory"],
+                     text=it["task"], deadline=tm,
+                     repeat_rule=it["repeat"], source=it["supplier"], is_repeating=bool(it["repeat"]))
             created += 1
         bot.send_message(uid, f"✅ Добавлено задач: {created}", reply_markup=main_menu())
     except Exception as e:
@@ -701,16 +627,10 @@ def search_text(m):
     try:
         uid = m.chat.id
         q = m.text.strip().lower()
-        rows = (sess.query(Task)
-                .filter(Task.user_id==uid)
-                .order_by(Task.date.desc())
-                ).all()
+        rows = (sess.query(Task).filter(Task.user_id==uid).order_by(Task.date.desc())).all()
         found = []
         for t in rows:
-            hay = " ".join([
-                dstr(t.date), t.category or "", t.subcategory or "",
-                t.text or "", t.status or "", t.repeat_rule or "", t.source or ""
-            ]).lower()
+            hay = " ".join([dstr(t.date), t.category or "", t.subcategory or "", t.text or "", t.status or "", t.repeat_rule or "", t.source or ""]).lower()
             if q in hay:
                 found.append((short_task_line(t), t.id))
         if not found:
@@ -740,7 +660,7 @@ def done_text(m):
         for t in rows:
             if t.status == "выполнено": continue
             low = (t.text or "").lower()
-            if supplier and normalize_supplier_name(supplier) not in normalize_supplier_name(low):
+            if supplier and supplier.lower() not in low:
                 continue
             if not supplier and not any(w in low for w in ["заказ","сделал","закуп"]):
                 continue
@@ -850,12 +770,10 @@ def cb_handler(c):
     if not data:
         bot.answer_callback_query(c.id); return
     a = data.get("a")
-
     sess = SessionLocal()
     try:
         if a == "page":
             page = int(data.get("p", 1))
-            pa   = data.get("pa")
             rows = get_tasks_for_date(sess, uid, now_local().date())
             items= [(short_task_line(t), t.id) for t in rows]
             total= (len(items)+PAGE_SIZE-1)//PAGE_SIZE
@@ -880,7 +798,6 @@ def cb_handler(c):
             t = complete_task(sess, tid, uid)
             if not t:
                 bot.answer_callback_query(c.id, "Не удалось", show_alert=True); return
-            # автопланирование по supplier
             sup = ""
             tl = (t.text or "").lower()
             if "к-экспро" in tl or "k-exp" in tl or "к экспро" in tl: sup="К-Экспро"
@@ -1011,13 +928,12 @@ def set_reminder_text(m):
         data= get_buf(uid)
         tid = int(data.get("task_id"))
         raw = m.text.strip()
-        # ожидаем "ДД.ММ.ГГГГ ЧЧ:ММ"
         parts = raw.split()
         if len(parts) != 2:
             bot.send_message(uid, "Формат: ДД.ММ.ГГГГ ЧЧ:ММ", reply_markup=main_menu()); clear_state(uid); return
         ds, ts = parts
         try:
-            r = create_reminder(sess, tid, uid, ds, ts)
+            create_reminder(sess, tid, uid, ds, ts)
             bot.send_message(uid, f"⏰ Напоминание на {ds} {ts} установлено.", reply_markup=main_menu())
         except Exception:
             bot.send_message(uid, "Не смог установить напоминание. Проверь формат.", reply_markup=main_menu())
@@ -1055,7 +971,6 @@ def job_daily_digest():
         today = now_local().date()
         users = sess.query(User).all()
         for u in users:
-            # расширяем повторяемость в момент рассылки
             expand_repeats_for_date(sess, u.id, today)
             tasks = get_tasks_for_date(sess, u.id, today)
             if not tasks: continue
@@ -1075,7 +990,6 @@ def job_reminders():
                .filter(Reminder.fired==False, Reminder.date<=now.date())
                .all())
         for r in due:
-            # если уже пора по времени
             if r.date < now.date() or (r.date == now.date() and r.time <= now.time().replace(second=0, microsecond=0)):
                 t = sess.query(Task).filter(Task.id==r.task_id, Task.user_id==r.user_id).first()
                 if t:
@@ -1100,7 +1014,7 @@ def scheduler_loop():
 # ========= FLASK/WEBHOOK =========
 app = Flask(__name__)
 
-@app.route("/" + os.getenv("WEBHOOK_SECRET"), methods=["POST"])
+@app.route("/" + WEBHOOK_SECRET, methods=["POST"])
 def webhook():
     data = request.get_data().decode("utf-8")
     upd = types.Update.de_json(data)
@@ -1111,16 +1025,12 @@ def webhook():
 def home():
     return "TasksBot is running"
 
-# ========= START =========
-if __name__ == "__main__":
-    init_db()
-    # webhook only
-    try:
-        bot.remove_webhook()
-    except Exception:
-        pass
-    time.sleep(0.5)
-    bot.set_webhook(url=WEBHOOK_URL)
+# ========= ИНИЦИАЛИЗАЦИЯ ПОД GUNICORN (важно) =========
+init_db()
+# запускаем планировщик в фоне при импорте (в каждом воркере свой поток)
+threading.Thread(target=scheduler_loop, daemon=True).start()
 
-    threading.Thread(target=scheduler_loop, daemon=True).start()
+# ========= ЛОКАЛЬНЫЙ ЗАПУСК (без вебхука) =========
+if __name__ == "__main__":
+    # Локальный dev-run (если нужно): ngrok -> WEBHOOK_BASE указывать на ngrok URL
     app.run(host="0.0.0.0", port=PORT)
